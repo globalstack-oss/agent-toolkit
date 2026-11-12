@@ -1,0 +1,16 @@
+{
+  "name": "globalstack",
+  "owner": {
+    "name": "Global Stack"
+  },
+  "metadata": {
+    "description": "Global Stack plugins for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "globalstack",
+      "source": "plugin",
+      "description": "Global Stack integration rules, tested reference code, a read-only account check and a local failure sandbox."
+    }
+  ]
+}

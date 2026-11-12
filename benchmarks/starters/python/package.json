@@ -1,0 +1,8 @@
+{
+  "name": "merchant-app",
+  "private": true,
+  "scripts": {
+    "start": ".venv/bin/python -m app.main",
+    "setup": ".venv/bin/python -m app.setup"
+  }
+}

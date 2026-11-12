@@ -1,0 +1,18 @@
+{
+  "name": "globalstack",
+  "version": "0.2.6",
+  "description": "Build a correct Global Stack integration with your coding agent: the integration rules, tested reference code, a read-only account check and a local failure sandbox.",
+  "author": {
+    "name": "Global Stack"
+  },
+  "homepage": "https://docs.globalstack.io",
+  "repository": "https://github.com/globalstack-oss/agent-toolkit",
+  "license": "MIT",
+  "keywords": [
+    "globalstack",
+    "payments",
+    "stablecoin",
+    "usdc",
+    "integration"
+  ]
+}

@@ -1,0 +1,7 @@
+# Secret scan settings for CI. The default rules, plus one allowlisted file.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The offline copy of the public API docs: its curl examples use placeholder keys (YOUR_SECRET_KEY, gsa_sk_live_...) and a sample Idempotency-Key"
+paths = ['''^plugin/skills/globalstack-integration/docs/llms-full\.txt$''']

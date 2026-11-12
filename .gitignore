@@ -1,0 +1,11 @@
+node_modules/
+.globalstack-sandbox/
+.tmp-svix2-*/
+site/
+
+# benchmark artifacts
+benchmarks/snapshot/raw.json
+benchmarks/*/reference/node_modules
+*.db
+__pycache__/
+.grade/

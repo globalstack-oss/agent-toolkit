@@ -1,0 +1,38 @@
+{
+  "name": "globalstack-plugin-src",
+  "private": true,
+  "type": "module",
+  "description": "Source of the scripts bundled into plugin/skills/*/scripts. Users never install this: the bundles have no dependencies.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/globalstack-oss/agent-toolkit.git"
+  },
+  "config": {
+    "repository": "globalstack-oss/agent-toolkit",
+    "latest": "https://raw.githubusercontent.com/globalstack-oss/agent-toolkit/main/plugin/.claude-plugin/plugin.json"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.code.json",
+    "test": "node --import tsx --test test/reference-code.test.ts test/sandbox.test.ts test/scripts.test.ts test/sim-flows.test.ts && node --test --test-concurrency=1 test/*.test.mjs",
+    "docs:refresh": "node refresh-docs.mjs"
+  },
+  "devDependencies": {
+    "@types/express": "4.17.25",
+    "@types/node": "22.19.1",
+    "esbuild": "0.25.10",
+    "express": "4.22.3",
+    "remark-frontmatter": "4.0.1",
+    "remark-gfm": "3.0.1",
+    "remark-mdx": "2.3.0",
+    "remark-parse": "10.0.2",
+    "remark-stringify": "10.0.3",
+    "svix": "1.99.1",
+    "svix-v2": "npm:svix@2.8.0",
+    "tsx": "4.23.14",
+    "typescript": "5.9.3",
+    "unified": "10.1.2",
+    "yaml": "2.9.1",
+    "zod": "4.6.7"
+  }
+}

@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Every job only reads the repository.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # node:sqlite, used by the example apps and the tests, needs Node 22.13 or later.
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: No high or critical advisories in the dependencies that ship
+        run: npm audit --omit=dev --audit-level=high
+      - run: npm run typecheck
+      - run: npm run build
+      - name: The committed bundles and manifests match the source
+        run: git diff --exit-code
+      - run: npm test
+      - name: Plugin and marketplace manifests
+        run: |
+          npx -y @anthropic-ai/claude-code plugin validate --strict ./plugin
+          npx -y @anthropic-ai/claude-code plugin validate --strict ./plugin/skills
+          npx -y @anthropic-ai/claude-code plugin validate --strict .
+
+  # Every commit, not only the newest, so a key committed and then deleted is still found.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks git --no-banner --redact --config .gitleaks.toml .
+
+  # The benchmarks' fast check: the plugin's reference code inside every reference app, graded against every
+  # failure scenario on the plugin's simulator. No agents, no API keys, about 10-15 minutes.
+  reference-apps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: benchmarks/starters/sqlite
+      - run: npm ci
+        working-directory: benchmarks/starters/postgres
+      # Postgres jobs: the grader starts its own throwaway cluster with the runner's preinstalled Postgres.
+      - run: echo "EVAL_PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)" >> "$GITHUB_ENV"
+      - run: node --experimental-strip-types --no-warnings harness/check-references.ts
+        working-directory: benchmarks
+        env:
+          EVAL_PG_DIR: ${{ runner.temp }}/gs-eval-pg
+      - name: The reference apps hold the plugin's current code
+        run: git diff --exit-code -- 'benchmarks/*/reference'

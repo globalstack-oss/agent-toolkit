@@ -1,0 +1,4548 @@
+<!-- Copy of https://docs.globalstack.io/llms-full.txt taken 2026-10-21, built from the site's source (github.com/Paystack-Passport/docs at 9fc4f95). gs.mjs search_docs reads it when the live docs cannot be reached. Refresh with: npm run docs:refresh -->
+# Authentication
+Source: https://docs.globalstack.io/api-reference/authentication
+
+Authenticate every request with your secret API key.
+
+The GlobalStack API uses **bearer authentication**. Pass your secret API key — issued during merchant onboarding — in the `Authorization` header of every request:
+
+```bash theme={null}
+Authorization: Bearer YOUR_SECRET_KEY
+```
+
+## Example request
+
+```bash theme={null}
+curl https://api.globalstack.io/v1/wallets \
+  -H "Authorization: Bearer YOUR_SECRET_KEY"
+```
+
+## Keys
+
+<Card title="Get your keys" icon="key" href="https://dashboard.globalstack.io">
+  Manage and rotate your API keys from the GlobalStack dashboard.
+</Card>
+
+* Your secret key authenticates server-to-server calls. **Treat it like a password** — never commit it to source control or expose it in client-side code.
+* A missing or invalid key returns `401` with the `authentication_failed` code. See [Errors](/errors).
+
+<Warning>
+  All requests must be made over HTTPS. Calls over plain HTTP fail.
+</Warning>
+
+
+# Auto-conversion credentials
+Source: https://docs.globalstack.io/api-reference/auto-conversion
+
+Accept deposits in one currency and settle them into a wallet in a different currency, automatically.
+
+Wallet credentials can accept deposits in a currency that differs from the wallet's own — arriving deposits are automatically converted into the wallet's currency at the FX rate live at conversion time. Two directions:
+
+* **Auto-onramp** — a fiat credential on a crypto wallet. The payer sends fiat; the wallet is credited in crypto.
+* **Auto-offramp** — a crypto credential on a fiat wallet. The payer sends crypto; the wallet is credited in fiat.
+
+Same-currency credentials — where the credential currency matches the wallet's currency — remain the default and credit the wallet balance directly, with no conversion.
+
+## Create a cross-currency credential
+
+Pass an explicit `currency` on [`POST /v1/wallets/:id/credentials`](/api-reference/openapi#tag/wallets/POST/v1/wallets/\{id}/credentials) that is different from the wallet's currency. Currency codes are uppercase (`NGN`, `USDC`, `GHS`, `USDT`, `KES`, …).
+
+<CodeGroup>
+  ```bash Auto-onramp (NGN on USDC wallet) theme={null}
+  curl https://api.globalstack.io/v1/wallets/wal_01HXYZABC1234567890ABCDEFG/credentials \
+    -H "Authorization: Bearer YOUR_SECRET_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "network": "bank",
+      "currency": "NGN"
+    }'
+  ```
+
+  ```bash Auto-offramp (USDC on NGN wallet) theme={null}
+  curl https://api.globalstack.io/v1/wallets/wal_01HXYZDEF9876543210ZYXWVUT/credentials \
+    -H "Authorization: Bearer YOUR_SECRET_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "network": "base",
+      "currency": "USDC"
+    }'
+  ```
+</CodeGroup>
+
+`network` is validated against the **credential's own** currency, not the wallet's. So an `NGN` credential uses `bank`; a `USDC` credential uses `base` / `ethereum` / `solana`.
+
+## Eligibility
+
+Cross-currency is admitted only when **every** condition below holds. Any failure returns a `400` with `invalid_input`.
+
+* The pair must be **crypto ↔ fiat**. Crypto ↔ crypto and fiat ↔ fiat are rejected.
+* **Both** currencies must advertise the matching direction capability:
+  * Auto-onramp requires `canOnramp` on the credential currency AND on the wallet currency.
+  * Auto-offramp requires `canOfframp` on both.
+* The credential currency must resolve to a supported currency row. An unknown code returns `404` `not_found`.
+
+<Note>
+  The set of currencies that support `canOnramp` / `canOfframp` is fixed by GlobalStack. If your wallet's currency isn't eligible for a given direction, cross-currency provisioning will fail — reach out to support to confirm coverage.
+</Note>
+
+## Minimum conversion amount
+
+Every corridor has a minimum convertible amount, and a conversion is only quoted once the
+credential's balance clears it. Below that, the deposit is still recorded and you are still
+notified — it simply has no converted value yet, and its funds wait on the credential for the next
+deposit.
+
+Conversions are sized from the **credential's whole available balance**, not from the deposit that
+triggered them. So two 3,000 NGN deposits into a credential with a 4,500 NGN minimum convert
+together as one 6,000 NGN conversion when the second arrives. Nothing is lost and nothing needs
+chasing; small deposits accumulate until they are worth converting.
+
+<Note>
+  You can read the minimum for a corridor from `GET /v1/currencies`: it is
+  `networks[].inbound.min` on the **credential's** currency, for the credential's `network`. The
+  amount compared against it is the credential's available balance, which includes anything left
+  over from earlier deposits — not the single deposit you just received.
+</Note>
+
+A deposit that was not converted on arrival carries `metadata.conversion_pending_reason`:
+
+| Reason          | What it means                                                                                                                               | What to do                                                                  |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `below_minimum` | The credential's balance is under the corridor minimum. `metadata.conversion_minimum` carries the floor that was applied.                   | Nothing. The next deposit converts both.                                    |
+| `fx_rejected`   | The amount was refused by the FX provider as outside the corridor's limits.                                                                 | Nothing automatic is pending; if the balance never clears, contact support. |
+| `deferred`      | The conversion could not be attempted at that moment — another deposit on the same credential was mid-conversion, or the attempt timed out. | Nothing. The next deposit sweeps the balance.                               |
+
+The deposit that finally triggers the conversion carries the **whole aggregated amount** as its
+`destination_amount`, which can be larger than its own `source_amount`.
+`metadata.converted_source_amount` tells you how much was actually converted.
+
+<Warning>
+  Because the aggregate lands on one deposit, **do not sum `destination_amount` across deposits** to
+  reconcile a credential. The deposits folded into an aggregate carry `null`, and the triggering
+  one carries the total. Reconcile against the `conversion.*` events, which are one-per-conversion.
+</Warning>
+
+## Deposit lifecycle
+
+A cross-currency deposit usually tells you twice: once when the money arrives, and again as the
+conversion moves. The arrival event waits for the FX quote where there is one, so it can tell you
+what the deposit is worth in your wallet's currency — the number you actually care about. Where the
+balance is under the corridor minimum there is no quote to wait for, and the arrival event carries
+no converted value.
+
+| Event                          | When it fires                                               | Meaning                                                                                                                                                                                                                                         |
+| ------------------------------ | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deposit.received`             | Payer's funds arrived and a rate was quoted                 | The deposit is recorded, with `destination_amount` in your wallet's currency.                                                                                                                                                                   |
+| `deposit.received` (no amount) | Funds arrived but the balance is under the corridor minimum | The deposit is recorded with a `null` `destination_amount` and a `metadata.conversion_pending_reason`. See [Minimum conversion amount](#minimum-conversion-amount). No `conversion.*` events follow until a later deposit converts the balance. |
+| `deposit.held`                 | Arrival breached your customer's money-in limit             | The deposit is parked pending review. No conversion is quoted yet, so there is no `destination_amount`.                                                                                                                                         |
+| `conversion.created`           | Conversion registered against the deposit                   | Rate is locked.                                                                                                                                                                                                                                 |
+| `conversion.funds_received`    | FX Engine has custody of the source funds                   | The FX-side settlement leg is queued.                                                                                                                                                                                                           |
+| `conversion.processing`        | Conversion is executing                                     | Money is moving through the FX rails.                                                                                                                                                                                                           |
+| `conversion.success`           | Conversion settled                                          | The **wallet balance** has been credited in the wallet's currency.                                                                                                                                                                              |
+| `conversion.failed`            | Conversion did not settle                                   | Funds are parked on the credential balance until GlobalStack drains it (see [Recovery on failure](#recovery-on-failure)).                                                                                                                       |
+| `conversion.returned`          | Conversion reversed after success                           | Same "funds parked, contact support" recovery as `conversion.failed`.                                                                                                                                                                           |
+
+### What `deposit.received` carries
+
+The event body is the transaction resource — the same shape as
+[`GET /v1/transactions/{transactionId}`](/api-reference/openapi#tag/transactions/GET/v1/transactions/\{transactionId}) — with `source_*` in the
+credential's currency and `destination_*` in your wallet's currency:
+
+```json theme={null}
+{
+  "event_type": "deposit.received",
+  "event_object": {
+    "id": "txn_01KPBG1Q3Z8X1Q6VJRE5R8ZFBG",
+    "type": "deposit",
+    "status": "received",
+    "source_amount": "10000.00",
+    "source_currency": "NGN",
+    "destination_amount": "6.046600",
+    "destination_currency": "USDC",
+    "metadata": {
+      "auto_conversion": "true",
+      "quote_id": "qt_01HXYZABC1234567890ABCDEFG",
+      "rate": "0.000605",
+      "converted_source_amount": "10000.00"
+    },
+    "deposit_timestamp": "2026-04-22T02:01:29.000Z",
+    "wallet": { "id": "wal_…", "currency": "USDC", "label": "Treasury USDC" },
+    "customer": { "id": "cust_…", "type": "business", "name": "Acme Ltd" },
+    "credential": {
+      "id": "wcr_…",
+      "currency": "NGN",
+      "network": "bank",
+      "details": {
+        "accountName": "Acme Ltd",
+        "accountNumber": "1234567890",
+        "bankName": "Wema Bank",
+        "bankCode": "035"
+      }
+    }
+  }
+}
+```
+
+The `wallet`, `customer` and `credential` blocks tell you which credential was funded without a
+second API call — useful when you hand out one virtual account per customer. They appear only on
+cross-currency deposit events.
+
+<Warning>
+  `destination_amount` is the **quoted** amount, not the settled one. It reflects the rate at
+  deposit time; the amount that actually lands is `actual_destination_amount` on
+  `conversion.success`. Reconcile against the conversion, not the deposit.
+</Warning>
+
+`converted_source_amount` is how much the quote actually converted. It equals `source_amount` on a
+deposit that converted on its own, and exceeds it when the conversion swept residue from earlier
+deposits.
+
+A deposit that was **not** converted carries the same shape with no converted value:
+
+```json theme={null}
+{
+  "event_type": "deposit.received",
+  "event_object": {
+    "id": "txn_01KPBG1Q3Z8X1Q6VJRE5R8ZFBH",
+    "type": "deposit",
+    "status": "received",
+    "source_amount": "3000.00",
+    "source_currency": "NGN",
+    "destination_amount": null,
+    "destination_currency": "USDC",
+    "metadata": {
+      "auto_conversion": "true",
+      "conversion_pending_reason": "below_minimum",
+      "conversion_minimum": "4500.00"
+    },
+    "deposit_timestamp": "2026-04-22T02:01:29.000Z"
+  }
+}
+```
+
+<Note>
+  A cross-currency deposit never reaches a terminal `deposit.*` state. It stays at `received` for
+  its whole life, and the `conversion.*` topics carry the outcome — do not wait for
+  `deposit.confirmed` or `deposit.failed` on this path. Subscribe to both the `deposit` and
+  `conversion` categories to see the full lifecycle.
+</Note>
+
+### Held deposits
+
+If an arriving deposit breaches the customer's rolling money-in limit, you get `deposit.held`
+instead, with `metadata.hold_reason` set to `tier_limit` and a null `destination_amount` — no
+conversion is quoted while the deposit is under review. When GlobalStack releases it, the
+conversion runs at the **then-current rate** and you receive `deposit.received` carrying the
+quoted amount, followed by the usual `conversion.*` sequence. A released deposit is subject to the
+same [minimum](#minimum-conversion-amount): if the balance is under the floor at release, the
+`deposit.received` you receive carries a `conversion_pending_reason` instead of an amount.
+
+### Same-currency credentials
+
+Same-currency credentials keep the original lifecycle: `deposit.received` on arrival,
+`deposit.held` if a tier gate applies, then `deposit.confirmed` when the credit settles (or
+`deposit.failed` if it does not). Their payloads do not carry the `wallet`, `customer` and
+`credential` blocks, and their `destination_amount` equals `source_amount` — there is no
+conversion.
+
+## Fees
+
+Auto-conversion fees follow the FX conversion contract: the destination amount is **net of fees**, and the fee breakdown is on the `conversion.*` webhook payloads. See [failure reasons](/api-reference/failure-reasons) for the codes surfaced on a failed conversion.
+
+## Recovery on failure
+
+If `conversion.failed` (or `conversion.returned`) fires, funds stay on the credential's own balance. There is no auto-retry of the failed conversion — FX failures are typically structural, not transient — but the parked funds are **not stranded**: because conversions are sized from the credential's whole available balance, the next deposit into that credential converts the leftover along with itself, at the then-current rate.
+
+If no further deposit is expected, contact GlobalStack support to drain the parked funds; ops will run a fresh conversion at the then-current rate. Once the drain lands, the wallet balance is credited and the credential balance clears.
+
+<Warning>
+  There is no merchant-facing "retry" or "refund" endpoint in v1. Recovery goes through GlobalStack support.
+</Warning>
+
+## When to use auto-conversion
+
+Reach for auto-conversion when your payers want to pay in a familiar local currency but your treasury runs in a different one — the classic example is accepting NGN bank deposits into a USDC treasury without a manual conversion step per deposit. If your payers already hold funds in the same currency as your wallet, stick with same-currency credentials: they credit the wallet directly with no FX exposure.
+
+
+# Create a beneficiary
+Source: https://docs.globalstack.io/api-reference/beneficiaries/create-a-beneficiary
+
+/api-reference/openapi.json post /v1/beneficiaries
+Create a beneficiary for `fiat` payouts (offramp) or `crypto` outbound transfers.
+
+Pass `type`, `currency`, and `corridor` fields at the top level (`country_code`, `network`, `account_number`,`provider_id`, `routing_number`, `address`, etc.). On read, we nest account information under details and expand `provider_id` to provider.
+
+### Body — shared fields
+
+- `type` — required. One of `fiat`, `crypto`.
+- `name` — required. Max 255 chars.
+- `label` — required. Max 128 chars.
+- `currency` — required. ISO/crypto currency code (2–8 uppercase alphanumerics).
+- `metadata` — optional. Free-form `Record<string, string>`.
+- `merchant_reference` — optional. Max 128 chars. Auto-generated as
+  `ref_<ULID>` when omitted. Per-integration unique.
+- `customer_id` — optional. GlobalStack customer external id
+  (`cust_<ULID>`). When omitted, the integration's default customer
+  is used; in that case `data.customer_id` in the response will carry
+  the default customer's external id, which is intentionally not
+  addressable via `GET /v1/customers/:customer_id`.
+
+### Body — fiat fields (`type = "fiat"`)
+
+- `country_code` — required. ISO-3166-1 alpha-2 (e.g. `NG`, `KE`).
+- `provider_id` — required, except with `rail = "payshap"`. GlobalStack
+  provider external id (`prov_<ULID>`). A PayShap proxy resolves to
+  whichever bank holds it, so no provider is chosen on that rail and any
+  value sent is ignored — though it is still format-checked when present.
+- `network` — required. One of `bank`, `mobile_money`. This says WHAT the
+  destination is; see `rail` for HOW money reaches it.
+- `rail` — optional. The payout rail, currently only `payshap`. Valid only
+  when `network = "bank"`, and only for `ZAR` in `ZA`. Omit for the
+  corridor's default rail, which is every beneficiary today.
+- `account_number` — required. What it carries depends on the delivery:
+  for `network = "mobile_money"` the phone number; for `rail = "payshap"`
+  a PayShap proxy — a South African mobile number in E.164 form
+  (e.g. `+27821234567`), or a **ShapName** with its bank (e.g.
+  `acme@nedbank`), which is how businesses usually register; send a
+  ShapName exactly as the recipient gives it, including the part after
+  `@`. For `network = "bank"` otherwise, the bank account number.
+- `account_name` — required, except where GlobalStack resolves the account
+  name from the provider: `network = "bank"` in currencies that resolve
+  (currently `NGN`, `GHS`), and `rail = "payshap"`, where the recipient's
+  bank returns the registered holder. In those cases `account_name` is
+  optional and, if supplied, is discarded in favour of the resolved
+  value. For every other combination the supplied `account_name` is what
+  we persist and pass to payout, so it is required.
+
+### Body — crypto fields (`type = "crypto"`)
+
+- `network` — required. One of `solana`, `base`, `ethereum`.
+- `address` — required. Max 128 chars.
+
+### Example — fiat (bank)
+
+```
+POST /v1/beneficiaries
+{
+  "type": "fiat",
+  "name": "Alice Bank Beneficiary",
+  "label": "Alice's salary account",
+  "currency": "NGN",
+  "country_code": "NG",
+  "network": "bank",
+  "account_number": "0039415616",
+  "provider_id": "prov_01KPBAP7WTDKQKW5B3R31VPNX4"
+}
+```
+
+### Example — crypto (USDC on Solana)
+
+```
+POST /v1/beneficiaries
+{
+  "type": "crypto",
+  "name": "Alice Wallet",
+  "label": "Personal cold wallet",
+  "currency": "USDC",
+  "network": "solana",
+  "address": "9wFFa…"
+}
+```
+
+
+
+
+# Deactivate a beneficiary
+Source: https://docs.globalstack.io/api-reference/beneficiaries/deactivate-a-beneficiary
+
+/api-reference/openapi.json delete /v1/beneficiaries/{beneficiaryId}
+Deactivates a beneficiary by changing its `status` to `archived`. The
+beneficiary record is preserved — list and get continue to return it.
+
+The path id is the GlobalStack external identifier (`ben_…`).
+
+### Response
+
+```json
+{
+  "status": true,
+  "message": "Beneficiary has been successfully deactivated",
+  "code": "ok",
+  "data": {
+    "id": "ben_01KPBAP7WTDKQKW5B3R31VPNX4",
+    "success": true
+  },
+  "meta": { "request_id": "req_…", "timestamp": "…", "version": "1" }
+}
+```
+
+### Status preconditions
+
+- `pending` → archived.
+- `active` → archived.
+- `archived` → `409 invalid_status` (not idempotent).
+
+### Errors
+
+- `400 invalid_input` — `beneficiary_id` does not start with `ben_`.
+- `404 not_found` — id does not exist or belongs to a different
+  integration.
+- `409 invalid_status` — beneficiary is already archived.
+
+### Example
+
+```
+DELETE /v1/beneficiaries/ben_01KPBAP7WTDKQKW5B3R31VPNX4
+```
+
+
+
+
+# Fetch a beneficiary
+Source: https://docs.globalstack.io/api-reference/beneficiaries/fetch-a-beneficiary
+
+/api-reference/openapi.json get /v1/beneficiaries/{beneficiaryId}
+Returns a single beneficiary scoped to the calling merchant.
+
+The path id is the GlobalStack external identifier (`ben_…`) returned by
+`POST /v1/beneficiaries` and `GET /v1/beneficiaries`.
+
+### Errors
+
+- `400 invalid_input` — `beneficiary_id` does not start with `ben_`.
+- `404 not_found` — returned for **all** lookup misses:
+  - the id does not exist;
+  - the beneficiary exists but belongs to a different merchant.
+
+### Example
+
+```
+GET /v1/beneficiaries/ben_01KPBAP7WTDKQKW5B3R31VPNX4
+```
+
+
+
+
+# List beneficiaries
+Source: https://docs.globalstack.io/api-reference/beneficiaries/list-beneficiaries
+
+/api-reference/openapi.json get /v1/beneficiaries
+List beneficiaries for your merchant account.
+
+All filters are optional. When no filters are supplied every merchant's beneficiary is returned (paginated).
+
+### Filter behavior
+
+- `customer_id` — restricts to beneficiaries owned by the named GlobalStack
+  customer (`cust_<ULID>`). Returns 404 if the customer is unknown.
+- `type` — restricts to beneficiaries of the given type. One of `fiat`, `crypto`.
+- `currency` — restricts to beneficiaries with the given uppercase currency
+  code (2-8 alphanumerics). Matched literally against stored values.
+
+### Pagination
+
+- `page` — 1-indexed page number. Defaults to `1`. Must be between `1` and `1,000,000`.
+- `per_page` — page size. Defaults to `50`. Must be between `1` and `200`.
+
+The response carries pagination metadata under `meta`:
+
+```json
+"meta": {
+  "request_id": "req_...",
+  "timestamp": "...",
+  "version": "1",
+  "page": 1,
+  "per_page": 50,
+  "total": 12,
+  "has_more": false
+}
+```
+
+`has_more` is `true` when at least one more page is available.
+
+### Ordering
+
+Results are sorted by `created_at DESC, id DESC` (newest first, deterministic on ties).
+
+### Example
+
+```
+GET /v1/beneficiaries?customer_id=cust_01KPBAP7WTDKQKW5B3R31VPNX4&type=fiat&currency=NGN&page=1&per_page=25
+```
+
+
+
+
+# Update a beneficiary
+Source: https://docs.globalstack.io/api-reference/beneficiaries/update-a-beneficiary
+
+/api-reference/openapi.json patch /v1/beneficiaries/{beneficiaryId}
+Partially updates an existing beneficiary. Returns the beneficiary in
+the same shape as `POST /v1/beneficiaries`.
+
+The path id is the GlobalStack external identifier (`ben_…`).
+
+### Mutable fields
+
+- `name`, `label`, `metadata`, `merchant_reference`
+- Fiat: `network`, `rail`, `account_number`, `account_name`, `provider_id`
+- Crypto: `network`, `address`
+
+### Immutable fields
+
+`type`, `customer_id`, `currency`, `country_code`. Including any of
+these in the request body fails validation with `400 bad_request`.
+To re-attach a beneficiary to a different customer or change its
+currency/country/type, create a new beneficiary.
+
+### Semantics
+
+- **`metadata`** is replaced whole-cloth when present. No deep merge —
+  the new map fully replaces the stored map.
+- **`merchant_reference`** is replace-only. Passing `null` to clear it
+  is rejected as `400 bad_request`.
+- **`network` change (fiat)** requires `provider_id` to also be sent.
+  The existing provider snapshot in `details.provider` is not
+  guaranteed to be valid for the new network, so GlobalStack re-calls FX
+  Engine `getAccountProvider` and refreshes the snapshot. Not required
+  when the resulting delivery resolves its own provider (`rail =
+  "payshap"`), which stores no provider at all.
+- **`rail`** is three-state: omitting it keeps the stored rail, `null`
+  clears it back to the corridor's default, and a value sets it. A rail is
+  never dropped as a side effect of another change.
+- **`rail` change** requires `account_number` to also be sent, in either
+  direction. The rail decides what that field means — a PayShap proxy
+  (a mobile number or a ShapName) or a bank account number — so the stored value is not an address
+  on the new rail. Clearing a PayShap rail additionally requires
+  `provider_id`, since a PayShap beneficiary stores neither.
+- **`provider_id` change** (fiat, on its own or alongside a network
+  change) triggers an FX Engine call to refresh `details.provider`. On a
+  rail that resolves its own provider it is ignored, and a patch carrying
+  only `provider_id` is treated as no change.
+- **All other validations** from `POST /v1/beneficiaries` apply to the
+  merged state: currency must be offramp-supported in
+  `details.country_code`; the resulting `network` must be supported by
+  the currency in that country; the resulting `rail` must be valid for
+  that network, currency and country; mobile-money beneficiaries require
+  an `account_name`; crypto network must be supported by the currency.
+
+### Status preconditions
+
+- `pending` → updated.
+- `active` → updated.
+- `archived` → `409 invalid_status`.
+
+### Errors
+
+- `400 bad_request` — request body fails field-level validation,
+  includes an immutable field, or sends `merchant_reference: null`.
+- `400 invalid_input` — a cross-field rule is broken (e.g. fiat
+  `network` change without `provider_id`) or the merged state fails a
+  currency/network check.
+- `404 not_found` — id does not exist or belongs to a different
+  integration.
+- `409 invalid_status` — beneficiary is archived.
+- `409 duplicate_resource` — `merchant_reference` collides with
+  another beneficiary in this integration.
+- `500 external_service_unavailable` — FX Engine call failed.
+
+### Example — change account number
+
+```
+PATCH /v1/beneficiaries/ben_01KPBAP7WTDKQKW5B3R31VPNX4
+{
+  "account_number": "0099887766"
+}
+```
+
+### Example — switch fiat network from bank to mobile_money
+
+```
+PATCH /v1/beneficiaries/ben_01KPBAP7WTDKQKW5B3R31VPNX4
+{
+  "network": "mobile_money",
+  "provider_id": "prov_01KPBBNEWPR0V1DERZZZZZZZ4M",
+  "account_number": "+2348012345678",
+  "account_name": "Alice Johnson"
+}
+```
+
+
+
+
+# Execute a conversion
+Source: https://docs.globalstack.io/api-reference/conversions/execute-a-conversion
+
+/api-reference/openapi.json post /v1/conversions
+Execute a conversion from a previously created conversion quote: converts the
+balance of the quote's source wallet into the quote's destination wallet.
+
+Supply the `quote_id` returned by `POST /v1/conversions/quotes`. `source_currency`
+and `destination_currency` are optional; when provided they must match the quote's
+currencies exactly, otherwise the request is rejected with `400 invalid_input`.
+`reference` is required and must be unique within your integration.
+
+The quote must belong to the calling integration, be of type `conversion`, and be
+unexpired. An expired quote returns `409 invalid_status`.
+
+Send an `Idempotency-Key` header to make retries safe: an identical key with an
+identical body within 24h replays the original response. A given quote can be
+executed at most once.
+
+> Note: `rate` and `destination_amount` are placeholders in the current release and
+> will be populated once FX Engine conversion execution lands.
+
+
+
+
+# Fetch a conversion
+Source: https://docs.globalstack.io/api-reference/conversions/fetch-a-conversion
+
+/api-reference/openapi.json get /v1/conversions/{conversionId}
+Fetches a single conversion by its external id (prefixed `con_`), scoped to the
+calling integration.
+
+### Path parameter
+
+- `id` — required. The conversion's external id (e.g.
+  `con_01KPBH8MD6R7YDJ82T4D6M3V1T`). A value that is not a valid `con_…` id
+  returns `400`. An id that does not exist or belongs to a different integration
+  returns `404`.
+
+### Example
+
+```
+GET /v1/conversions/con_01KPBH8MD6R7YDJ82T4D6M3V1T
+```
+
+
+
+
+# List conversions
+Source: https://docs.globalstack.io/api-reference/conversions/list-conversions
+
+/api-reference/openapi.json get /v1/conversions
+Returns the calling integration's conversions, newest first. Results are scoped
+to the authenticated integration; conversions belonging to other integrations
+are never returned.
+
+All filters are optional. With no filters, every conversion for the integration
+is returned (paginated).
+
+### Filter behavior
+
+- `customer_id` — restricts to conversions for a single customer. Must be a
+  valid `cust_…` id. An unknown or cross-integration id returns an empty page
+  (`200`, `data: []`), not `404`.
+- `status` — restricts to a single lifecycle status. One of `created`,
+  `processing`, `temporary_failure`, `success`, `failed`, `returned`.
+- `created_after` / `created_before` — either a `YYYY-MM-DD` calendar date (UTC,
+  inclusive: `created_after` matches at or after `00:00:00`, `created_before` at
+  or before `23:59:59.999`) or a full ISO 8601 UTC timestamp ending in `Z`
+  (e.g. `2026-04-16T16:16:03Z`), used as the exact instant.
+
+### Pagination
+
+- `page` — 1-indexed page number. Defaults to `1`. Must be between `1` and `1,000,000`.
+- `per_page` — page size. Defaults to `50`. Must be between `1` and `200`.
+
+The response carries pagination metadata under `meta`:
+
+```json
+"meta": {
+  "request_id": "req_...",
+  "timestamp": "...",
+  "version": "1",
+  "page": 1,
+  "per_page": 50,
+  "total": 137,
+  "has_more": true
+}
+```
+
+`has_more` is `true` when at least one more page is available.
+
+### Ordering
+
+Results are sorted by `created_at DESC, id DESC` (newest first, deterministic on
+ties).
+
+### Example
+
+```
+GET /v1/conversions?status=processing&customer_id=cust_seed_alice&page=1&per_page=50
+```
+
+
+
+
+# Customer restrictions
+Source: https://docs.globalstack.io/api-reference/customer-restrictions
+
+Why a capability the platform supports can be unavailable to a specific customer, and what to do about it.
+
+`GET /v1/currencies` describes what the platform supports: each currency carries
+capability flags (`can_deposit`, `can_onramp`, …) that are the same for every caller.
+
+Some capabilities also depend on the state of the customer you are acting for. Pass the
+optional `customer_id` query parameter and the same flags answer a narrower question —
+what can **this customer** do right now? The capability filters (`can_deposit=true`, …)
+are then evaluated against the customer's view too.
+
+## Reading `customer_restrictions`
+
+When a capability the platform supports is unavailable to the customer, the flag reads
+`false` and the row carries a `customer_restrictions` entry explaining why:
+
+```json theme={null}
+{
+  "code": "NGN",
+  "type": "fiat",
+  "can_deposit": false,
+  "customer_restrictions": [
+    {
+      "capability": "deposit",
+      "reason": "customer_kyc_not_approved",
+      "next_steps": {
+        "action": "Drive the customer through KYC via POST /v1/customers/:id/verifications, then retry.",
+        "docs_url": "https://docs.globalstack.io/api-reference/customer-restrictions"
+      }
+    }
+  ]
+}
+```
+
+`customer_restrictions` lists exactly the difference between the platform view and the
+customer's view:
+
+* It appears only when you pass `customer_id`, and only on rows where a capability the
+  platform supports was removed by the customer's state.
+* Capabilities the platform itself does not support are never listed — a flag that is
+  `false` in the platform view stays a plain `false`.
+
+<Note>
+  Branch on `reason`, not on the `next_steps` copy — the code is stable, the wording is
+  not. This mirrors how you branch on `failure_reason` for failed money movements. See
+  [Failure reasons](/api-reference/failure-reasons).
+</Note>
+
+## Restriction reasons
+
+Branch on `reason` — it is a stable, machine-readable code.
+
+| Reason                      | Meaning                                                                                    | How to lift it                                                                                                                                                                  |
+| --------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `customer_kyc_not_approved` | The customer has not completed KYC verification, so fiat deposits are unavailable to them. | Start a verification with `POST /v1/customers/{customerId}/verifications` and have the customer complete it. Once their `kyc_status` is `approved`, the restriction disappears. |
+
+
+# Create a customer
+Source: https://docs.globalstack.io/api-reference/customers/create-a-customer
+
+/api-reference/openapi.json post /v1/customers
+Creates a new customer scoped to the calling merchant's integration.
+
+### Body
+
+- `type` — required. One of `individual`, `business`.
+- `name` — required. Full name of the customer. Max 255 chars.
+- `email` — required. Valid email. Max 255 chars. Per-integration uniqueness
+  is enforced case-insensitively.
+- `country_code` — required. ISO-3166-1 alpha-2 (e.g. `NG`, `KE`). Countries on the
+  compliance prohibited list are rejected with `400 prohibited_country`.
+- `metadata` — optional. Free-form `Record<string, string>`.
+- `merchant_reference` — optional. Max 128 chars. Auto-generated as
+  `ref_<ULID>` when omitted. Per-integration unique.
+- `profile` — optional object carrying the identity fields required to convert
+  (onramp/offramp). When supplied it must be complete for the customer `type`:
+  - `individual` requires `phone`, `address`, `date_of_birth`, `id_number`, `id_type`.
+  - `business` requires `phone`, `business_licence`.
+
+  Fields: `phone`, `address`, `id_number`, `id_type`, `business_licence` are strings;
+  `date_of_birth` must be `mm/dd/yyyy`. A supplied-but-incomplete `profile` for the
+  `type` returns `400 invalid_input`.
+
+### Example
+
+```
+POST /v1/customers
+{
+  "type": "individual",
+  "name": "Alice Johnson",
+  "email": "alice@example.com",
+  "country_code": "NG",
+  "profile": {
+    "phone": "+2348012345678",
+    "address": "1 Marina Rd, Lagos",
+    "date_of_birth": "01/15/1990",
+    "id_number": "A12345678",
+    "id_type": "passport"
+  }
+}
+```
+
+
+
+
+# Fetch a customer
+Source: https://docs.globalstack.io/api-reference/customers/fetch-a-customer
+
+/api-reference/openapi.json get /v1/customers/{customerId}
+Returns a single customer scoped to the calling integration.
+
+The path id is the GlobalStack external identifier (`cust_…`) returned by
+`POST /v1/customers` and `GET /v1/customers`.
+
+### Errors
+
+- `400 invalid_input` — `customer_id` does not start with `cust_`. This catches
+  callers passing a non-GlobalStack id.
+- `404 not_found` — returned for **all** lookup misses:
+  - the id does not exist;
+  - the customer exists but belongs to a different integration;
+  
+
+  These cases share a single 404 response so a caller cannot distinguish "doesn't
+  exist" from "belongs to someone else".
+
+### Example
+
+```
+GET /v1/customers/cust_01HXYZABC1234567890ABCDEFG
+```
+
+
+
+
+# Get customer's verification status
+Source: https://docs.globalstack.io/api-reference/customers/get-customers-verification-status
+
+/api-reference/openapi.json get /v1/customers/{customerId}/verifications
+Return the current or most recent verification session for the customer.
+
+The response includes `hosted_url` — the hosted verification URL the customer must open to complete verification — alongside `hosted_url_expires_at`. Callers can reuse the URL while the session is still `pending` and the expiry is in the future; once it expires, start a fresh session via `POST /v1/customers/{customer_id}/verifications`.
+
+If no session exists yet, the response is a `404 not_found` whose `meta.next_steps` points the caller at `POST /v1/customers/{customer_id}/verifications` to create one.
+
+### Path
+
+- `customer_id` — required. The `cust_…` external id of an existing customer that belongs to the calling integration.
+
+### 404 cases
+
+- Customer does not exist or belongs to a different integration.
+- Customer has never had a verification session created — `meta.next_steps.action` guides the caller to start one via `POST /v1/customers/{customer_id}/verifications`.
+
+### Example
+
+```
+GET /v1/customers/cust_01HXYZ/verifications
+```
+
+
+
+
+# List customers
+Source: https://docs.globalstack.io/api-reference/customers/list-customers
+
+/api-reference/openapi.json get /v1/customers
+List customers for your merchant. Filter by `type` and `kyc_status` to narrow results.
+
+All filters are optional. When no filters are supplied every customer is returned (paginated).
+
+### Filter behavior
+
+- `type` — restricts to customers of the given type. One of `individual`, `business`.
+- `kyc_status` — restricts to customers in the given KYC state. One of
+  `not_started`, `pending`, `in_progress`, `approved`, `rejected`, `expired`.
+
+### Pagination
+
+- `page` — 1-indexed page number. Defaults to `1`. Must be between `1` and `1,000,000`.
+- `per_page` — page size. Defaults to `50`. Must be between `1` and `200`.
+
+The response carries pagination metadata under `meta`:
+
+```json
+"meta": {
+  "request_id": "req_...",
+  "timestamp": "...",
+  "version": "1",
+  "page": 1,
+  "per_page": 50,
+  "total": 21,
+  "has_more": false
+}
+```
+
+`has_more` is `true` when at least one more page is available.
+
+### Ordering
+
+Results are sorted by `created_at DESC, id DESC` (newest first, deterministic on ties).
+
+### Example
+
+```
+GET /v1/customers?type=individual&kyc_status=not_started&page=1&per_page=25
+```
+
+
+
+
+# Start verification for a customer
+Source: https://docs.globalstack.io/api-reference/customers/start-verification-for-a-customer
+
+/api-reference/openapi.json post /v1/customers/{customerId}/verifications
+Creates a hosted verification session for a customer scoped to the calling
+integration. The returned `hosted_url` is the hosted verification link that
+the merchant must surface to their customer to complete verification.
+
+### Path
+
+- `customer_id` — required. The `cust_…` external id of an existing,
+  non-default customer that belongs to the calling integration.
+
+### Body
+
+- `tier` — optional. One of `tier_1`, `tier_2`. Defaults to the next tier
+  above the customer's current tier (`tier_0` → `tier_1`; `tier_1` →
+  `tier_2`). `tier_0` is never a valid requested tier.
+- `redirect_url` — optional. HTTPS URL the merchant wants the customer
+  redirected to after the verification flow completes. Stored verbatim and
+  echoed back on the response.
+
+### Replay & link refresh
+
+If a `pending` session already exists for the same `(customer_id,
+tier_requested)` and its `hosted_url_expires_at` is in the future, this
+endpoint returns that existing session unchanged — no second upstream call.
+Clients can safely retry POSTs without an Idempotency-Key header.
+
+If that `pending` session exists but its `hosted_url` has **expired**, this
+endpoint mints a fresh hosted link and refreshes the same session in place,
+returning it with a new `hosted_url` / `hosted_url_expires_at`. Call this
+endpoint again to regenerate an expired verification link.
+
+### Example
+
+```
+POST /v1/customers/cust_01HXYZ/verifications
+{
+  "tier": "tier_1",
+  "redirect_url": "https://merchant.com/onboarding/complete"
+}
+```
+
+
+
+
+# Update a customer
+Source: https://docs.globalstack.io/api-reference/customers/update-a-customer
+
+/api-reference/openapi.json patch /v1/customers/{customerId}
+Updates a customer scoped to the calling merchant's integration. Supports partial updates —
+omit any field to leave it unchanged. An empty body is valid and returns the current customer
+with `200`.
+
+### Mutable fields
+
+- `name` — optional. Full name. Max 255 chars. Re-validated only when present in the patch;
+  `individual` customers must still have a whitespace-separated first + last name.
+- `email` — optional. Valid email. Max 255 chars. Per-integration uniqueness is enforced
+  case-insensitively — colliding with another customer's email returns
+  `409 duplicate_resource`.
+- `metadata` — optional. Free-form `Record<string, string>`. **Sending `metadata` replaces
+  the entire object** — existing keys not present in the new value are removed.
+- `profile` — optional. Field-by-field merge: only the sub-keys you send are written;
+  untouched slots are preserved. Sub-fields:
+  - `phone`, `address`, `id_number`, `id_type`, `business_licence` — strings.
+  - `date_of_birth` — must be `mm/dd/yyyy`.
+
+There is no way to clear a `profile` or `metadata` key via this endpoint — omit a key to
+leave it; send a value to overwrite it.
+
+### Read-only fields
+
+These are rejected with `400 bad_request` if included in the body (DTO validation rejects
+any unknown top-level key). Set them at create time and they remain fixed:
+
+- `type`
+- `country_code`
+- `merchant_reference`
+
+### Example
+
+```
+PATCH /v1/customers/cust_01HXYZABC1234567890ABCDEFG
+{
+  "profile": {
+    "phone": "+2349999999999"
+  },
+  "metadata": {
+    "plan": "gold"
+  }
+}
+```
+
+
+
+
+# Failure reasons
+Source: https://docs.globalstack.io/api-reference/failure-reasons
+
+Stable codes that tell you why a money movement or verification failed, so you can branch on the outcome.
+
+When a money movement or verification fails, the resource carries two fields that explain why:
+
+* **`failure_reason`** — a stable, machine-readable code. Branch on this.
+* **`failure_reason_message`** — human-readable copy describing the failure. Show this to a user, but
+  do not hardcode or match on it: the wording is English today and may be reworded or localized later.
+
+Both fields appear in REST responses **and** in the matching webhook event payloads, so you get the
+same reason whether you poll or receive a push.
+
+```json theme={null}
+{
+  "id": "ofr_01HXYZ4K5ABCDEFGHJKLMNPQRS",
+  "status": "failed",
+  "failure_reason": "insufficient_funds",
+  "failure_reason_message": "There were not enough funds to complete this transaction."
+}
+```
+
+<Note>
+  Branch on `failure_reason`, not on `failure_reason_message` — the code is stable, the message is
+  not. This mirrors how you branch on a top-level error `code` rather than its `message`. See
+  [Errors](/errors).
+</Note>
+
+## When the fields are present
+
+`failure_reason` and `failure_reason_message` are `null` (or absent) unless the resource actually
+reached a bad outcome. They are populated on:
+
+* Money movements that did not succeed — an `onramp`, `offramp`, `conversion`, or `transfer` with
+  `status: "failed"`, **and** an `onramp`, `offramp`, or `conversion` with `status: "returned"`.
+* Failed verifications — the `kyc.rejected` webhook event and the verification endpoints.
+
+<Warning>
+  `returned` is the one case where these fields are set while `status` is **not** `"failed"`. If you
+  read `failure_reason` only when `status === "failed"`, you will miss it. Gate on the resource not
+  having succeeded, not on the literal string `"failed"`.
+</Warning>
+
+Some codes are intentionally generic. We expose what is safe and actionable; we do not reveal
+internal or provider mechanics. Any internal state we do not surface specifically collapses to a
+generic code — `failed` for money movements, `verification_failed` for verifications.
+
+## Money movement codes
+
+These apply to an `onramp`, `offramp`, `conversion`, or `transfer` that did not succeed.
+
+| `failure_reason`          | `failure_reason_message`                                                                     |
+| ------------------------- | -------------------------------------------------------------------------------------------- |
+| `insufficient_funds`      | There were not enough funds to complete this transaction.                                    |
+| `funding_failed`          | This transaction failed before any funds moved: its funding transfer could not be completed. |
+| `quote_expired`           | Payment was not received before the quote expired.                                           |
+| `temporarily_unavailable` | This transaction could not be completed right now. Please try again later.                   |
+| `cancelled`               | The transaction was cancelled.                                                               |
+| `reversed`                | The transaction was reversed.                                                                |
+| `refund_failed`           | This transaction failed, and the refund could not be completed.                              |
+| `returned`                | This transaction was returned; any funds debited for it have been released.                  |
+| `failed`                  | This transaction could not be completed.                                                     |
+
+`temporarily_unavailable` is the retryable one — retry the request with backoff. `failed` is
+deliberately generic: a provider decline, invalid upstream input, a released hold, and anything
+otherwise unrecognised all collapse to it.
+
+`quote_expired` means nobody paid in before the quote's rate window closed — **not** that anything
+went wrong on our side. No funds moved, so it is always safe to create a fresh quote and try again.
+This is the most common non-success outcome by a wide margin, so if you alert on failures, exclude
+this code: counting it inflates your apparent failure rate with transactions that were simply never
+funded. It applies to `onramp`, `offramp`, and `conversion`.
+
+`funding_failed` is reported on an offramp whose funding transfer could not be completed. The
+offramp fails immediately rather than sitting in `processing` until its quote expires, and no funds
+moved — create a new quote and retry.
+
+`refund_failed` means the transaction failed and the refund attempt did not complete. Unlike the
+other codes it may need our involvement to resolve — contact support with the resource id rather
+than retrying.
+
+`returned` accompanies `status: "returned"`, not `"failed"` (see the warning above). Its message
+deliberately does not promise a credit, because whether one happens depends on how far the
+transaction got: an offramp whose payout had already settled is credited back in full — appearing as
+a `deposit`-type transaction — while a transaction that never debited you has nothing to credit
+back. Check your wallet balance or transactions list rather than inferring a credit from this code.
+
+## Verification (KYC) codes
+
+These apply to the `kyc.rejected` webhook event and the verification endpoints.
+
+| `failure_reason`                  | `failure_reason_message`                                                        |
+| --------------------------------- | ------------------------------------------------------------------------------- |
+| `document_quality`                | The submitted document could not be read clearly. Please upload a clearer copy. |
+| `document_invalid`                | The submitted document is not valid or not accepted for verification.           |
+| `identity_mismatch`               | The submitted details or selfie did not match the identity document.            |
+| `additional_information_required` | Additional information or documents are required to complete verification.      |
+| `verification_unavailable`        | Verification could not be completed because a required check was unavailable.   |
+| `duplicate`                       | A verification already exists for this applicant.                               |
+| `not_eligible`                    | The applicant is not eligible for verification.                                 |
+| `business_verification_failed`    | The business could not be verified with the information provided.               |
+| `verification_failed`             | Your verification could not be approved. Please contact support.                |
+
+The first eight are actionable — the applicant can usually fix the problem and resubmit.
+`verification_failed` is deliberately generic: any rejection we should not detail collapses to it,
+and we never reveal the underlying detection.
+
+
+# Idempotency
+Source: https://docs.globalstack.io/api-reference/idempotency
+
+Safely retry write requests without creating duplicates.
+
+Network calls can fail after the server has already done the work. To retry safely, send an **idempotency key** on write requests (`POST`). If the same key arrives twice, GlobalStack replays the original response instead of performing the action again.
+
+## Sending a key
+
+Pass a unique value in the `Idempotency-Key` header:
+
+```bash theme={null}
+curl https://api.globalstack.io/v1/transfers \
+  -X POST \
+  -H "Authorization: Bearer YOUR_SECRET_KEY" \
+  -H "Idempotency-Key: 8f2a1c4e-7b3d-4a90-bf12-9c5e6a1d2b34" \
+  -H "Content-Type: application/json" \
+  -d '{ ... }'
+```
+
+The key must match `^[A-Za-z0-9_\-]{8,255}$` — 8 to 255 characters of letters, digits, underscores, or hyphens. A UUID works well. A malformed key returns `400 invalid_input`.
+
+## How replays are resolved
+
+<Steps>
+  <Step title="Same key, same body">
+    The original, stored response is replayed — the action runs only once.
+  </Step>
+
+  <Step title="Same key, still processing">
+    If the first request hasn't finished yet, the retry returns `idempotency_in_progress`. Wait and retry.
+  </Step>
+
+  <Step title="Same key, different body">
+    Reusing a key with a different request body returns `idempotency_conflict`. Always generate a fresh key for a genuinely new request.
+  </Step>
+</Steps>
+
+<Note>
+  Keys expire after a retention window, so reuse a key only for retries of the *same* request — not indefinitely.
+</Note>
+
+
+# Get caller identity and memberships
+Source: https://docs.globalstack.io/api-reference/me/get-caller-identity-and-memberships
+
+/api-reference/openapi.json get /v1/me
+Returns the authenticated caller's identity, current active membership, all active memberships across integrations, and effective role. The `user` block represents the consumer principal the request acts as — populated for both JWT and API key auth via the bound membership. It is `null` for internal-owned keys (no consumer membership).
+
+
+
+# Create a webhook endpoint
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/create-a-webhook-endpoint
+
+/api-reference/openapi.json post /v1/notifications/webhooks
+Register an HTTPS endpoint to receive webhook events for your integration.
+
+Subscribe to one or more **event categories** — coarse families of events rather than
+individual topics. The available categories are: `onramp`, `offramp`, `conversion`,
+`transfer`, `deposit`, `kyc`.
+
+Every event in a subscribed category is delivered. For the events each category contains,
+when each one fires, and the payload it carries, see
+[Webhook events](https://docs.globalstack.io/webhooks/events).
+
+The response includes a **`signing_secret`** (prefixed `whsec_`) returned **in plaintext
+exactly once** — on create and on rotate-secret only. Store it securely; you cannot retrieve
+it again. Use it to verify the signature on every delivered event.
+
+New endpoints are created **inactive** (`active: false`). Activate the endpoint with a
+`PATCH` once you have stored the signing secret and are ready to receive deliveries.
+
+### Body
+
+- `url` — required. Must be a valid **HTTPS** URL.
+- `event_categories` — required. Non-empty array of event categories (see above). Unknown
+  values are rejected with `400`.
+
+### Example
+
+```
+POST /v1/notifications/webhooks
+{
+  "url": "https://merchant.example.com/webhooks",
+  "event_categories": ["onramp", "conversion"]
+}
+```
+
+
+
+
+# Delete a webhook endpoint
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/delete-a-webhook-endpoint
+
+/api-reference/openapi.json delete /v1/notifications/webhooks/{id}
+Delete a webhook endpoint. After deletion the endpoint stops receiving events and its
+signing secret is invalidated. Returns `404` if the endpoint does not exist in your
+integration.
+
+The response envelope carries `data: null` on success.
+
+### Example
+
+```
+DELETE /v1/notifications/webhooks/whr_01HXYZABC1234567890ABCDEFG
+```
+
+
+
+
+# Fetch a webhook endpoint
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/fetch-a-webhook-endpoint
+
+/api-reference/openapi.json get /v1/notifications/webhooks/{id}
+Fetch a single webhook endpoint by its `whr_…` id.
+
+Returns the endpoint's `url`, subscribed `event_categories`, `active` flag, and timestamps.
+The `signing_secret` is not included. Returns `404` if the endpoint does not exist in your
+integration.
+
+### Example
+
+```
+GET /v1/notifications/webhooks/whr_01HXYZABC1234567890ABCDEFG
+```
+
+
+
+
+# List delivery logs
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/list-delivery-logs
+
+/api-reference/openapi.json get /v1/notifications/webhooks/{id}/logs
+Returns the delivery-attempt history for a webhook endpoint, newest first. Each row records
+one attempt to deliver one event: which event (`event_idempotency_key` + `topic`), the
+delivery leg's status, the attempt number, whether it succeeded, the HTTP status the endpoint
+returned, any error message, and the round-trip latency.
+
+Use this to debug why an endpoint is or isn't receiving events.
+
+### Pagination
+
+- `page` — 1-indexed page number. Defaults to `1`. Between `1` and `1,000,000`.
+- `per_page` — page size. Defaults to `50`. Between `1` and `200`.
+
+The response carries pagination metadata under `meta` (`page`, `per_page`, `total`,
+`has_more`).
+
+### Example
+
+```
+GET /v1/notifications/webhooks/whr_01HXYZABC1234567890ABCDEFG/logs?page=1&per_page=50
+```
+
+
+
+
+# List upcoming (queued) events
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/list-upcoming-queued-events
+
+/api-reference/openapi.json get /v1/notifications/webhooks/{id}/events
+Returns the events currently queued for delivery to a webhook endpoint (pending, not yet
+delivered), oldest first. Each entry identifies the event by its `event_idempotency_key` and
+`topic`, how many delivery attempts have been made so far, when the last attempt ran, and the
+`payload` that will be delivered.
+
+Use this to see what is in flight for an endpoint — for example after reactivating a paused
+endpoint or while investigating a delivery backlog.
+
+### Example
+
+```
+GET /v1/notifications/webhooks/whr_01HXYZABC1234567890ABCDEFG/events
+```
+
+
+
+
+# List webhook endpoints
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/list-webhook-endpoints
+
+/api-reference/openapi.json get /v1/notifications/webhooks
+Returns all webhook endpoints registered for the calling integration.
+
+Each endpoint reports its `id` (`whr_…`), delivery `url`, subscribed `event_categories`,
+`active` flag, and timestamps. The `signing_secret` is **never** returned here — it is only
+exposed on create and rotate-secret.
+
+### Example
+
+```
+GET /v1/notifications/webhooks
+```
+
+
+
+
+# Rotate the signing secret
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/rotate-the-signing-secret
+
+/api-reference/openapi.json post /v1/notifications/webhooks/{id}/rotate-secret
+Rotate the signing secret for a webhook endpoint. Returns a **new** `signing_secret`
+(prefixed `whsec_`) in plaintext — this is the only time it is shown, so store it
+immediately.
+
+Rotate the secret if the current one may have been exposed. After rotation, verify incoming
+deliveries against the new secret.
+
+### Example
+
+```
+POST /v1/notifications/webhooks/whr_01HXYZABC1234567890ABCDEFG/rotate-secret
+```
+
+
+
+
+# Send (replay) an event to the endpoint
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/send-replay-an-event-to-the-endpoint
+
+/api-reference/openapi.json post /v1/notifications/webhooks/{id}/send
+Manually (re)send an existing event to this webhook endpoint. Identify the event by its
+`event_idempotency_key` (the id of an event already known to the system). The request is
+accepted for asynchronous delivery and the response echoes the queued event's `topic` and
+`status`.
+
+Use this to replay an event the endpoint missed — for example after fixing an outage on your
+receiver, or after activating an endpoint that should have received an earlier event.
+
+Events are only delivered to **active** endpoints. Sending to an inactive endpoint returns
+`409 invalid_status` (`"… is inactive; reactivate it before sending."`) — activate it with
+`PATCH … { "active": true }` first, then retry.
+
+### Body
+
+- `event_idempotency_key` — required. The idempotency key of the existing event to (re)deliver.
+
+### Example
+
+```
+POST /v1/notifications/webhooks/whr_01HXYZABC1234567890ABCDEFG/send
+{
+  "event_idempotency_key": "evt-1"
+}
+```
+
+
+
+
+# Update a webhook endpoint
+Source: https://docs.globalstack.io/api-reference/notification-webhooks/update-a-webhook-endpoint
+
+/api-reference/openapi.json patch /v1/notifications/webhooks/{id}
+Update a webhook endpoint. This is a partial update — supply only the fields you want to
+change. At least one field is required.
+
+Use this to **activate** a newly-created endpoint (`"active": true`), repoint its `url`, or
+change which `event_categories` it is subscribed to. Updating `event_categories` **replaces**
+the full subscription set (it is not additive).
+
+### Body (all optional, at least one required)
+
+- `url` — a valid **HTTPS** URL.
+- `event_categories` — non-empty array of event categories; replaces the current set.
+- `active` — `true` to start receiving deliveries, `false` to pause them.
+
+An empty body, or any unknown field, is rejected with `400`.
+
+### Example
+
+```
+PATCH /v1/notifications/webhooks/whr_01HXYZABC1234567890ABCDEFG
+{
+  "active": true,
+  "event_categories": ["onramp", "offramp", "kyc"]
+}
+```
+
+
+
+
+# Execute an offramp
+Source: https://docs.globalstack.io/api-reference/offramps/execute-an-offramp
+
+/api-reference/openapi.json post /v1/offramps
+Execute a previously created **offramp quote**: pays out the quote's source crypto
+to the quote's fiat beneficiary.
+
+Submit the `quote_id` returned by `POST /v1/offramps/quotes`. `source_currency` and
+`destination_currency` are optional; when supplied they must match the quote's
+currencies exactly, otherwise the request is rejected with `400 invalid_input`.
+`reference` is your idempotency reference and must be unique within your integration.
+
+An expired quote returns `409 invalid_status`. A given quote can be
+executed only once; a second execute returns `409 duplicate_resource`.
+
+The offramp is created in the `created` state and advances asynchronously
+(`created` → `processing` → `success`/`failed`). Send an `Idempotency-Key` header
+to make retries safe.
+
+
+
+# Fetch an offramp
+Source: https://docs.globalstack.io/api-reference/offramps/fetch-an-offramp
+
+/api-reference/openapi.json get /v1/offramps/{offrampId}
+Fetches a single offramp by its external id (prefixed `ofr_`).
+
+### Path parameter
+
+- `id` — required. The offramp's external id (e.g. `ofr_01KPBH887CCT3A53EW3F8R0VQG`).
+  A value that is not a valid `ofr_…` id returns `400`. An id that does not exist returns `404`.
+
+### Example
+
+```
+GET /v1/offramps/ofr_01KPBH887CCT3A53EW3F8R0VQG
+```
+
+
+
+
+# List offramps
+Source: https://docs.globalstack.io/api-reference/offramps/list-offramps
+
+/api-reference/openapi.json get /v1/offramps
+List offramps, newest first.
+
+All filters are optional. With no filters, every offramp for the integration is
+returned (paginated).
+
+### Filter behavior
+
+- `customer_id` — restricts to offramps for a single customer. Must be a valid
+  `cust_…` id. An unknown id returns an empty page (`200`,
+  `data: []`), not `404`.
+- `status` — restricts to a single lifecycle status. One of `created`,
+  `processing`, `temporary_failure`, `success`, `failed`, `returned`.
+- `created_after` / `created_before` — either a `YYYY-MM-DD` calendar date (UTC,
+  inclusive: `created_after` matches at or after `00:00:00`, `created_before` at
+  or before `23:59:59.999`) or a full ISO 8601 UTC timestamp ending in `Z`
+  (e.g. `2026-04-16T16:16:03Z`), used as the exact instant.
+
+### Pagination
+
+- `page` — 1-indexed page number. Defaults to `1`. Must be between `1` and `1,000,000`.
+- `per_page` — page size. Defaults to `50`. Must be between `1` and `200`.
+
+The response carries pagination metadata under `meta`:
+
+```json
+"meta": {
+  "request_id": "req_...",
+  "timestamp": "...",
+  "version": "1",
+  "page": 1,
+  "per_page": 50,
+  "total": 137,
+  "has_more": true
+}
+```
+
+`has_more` is `true` when at least one more page is available.
+
+### Ordering
+
+Results are sorted by `created_at DESC, id DESC` (newest first, deterministic on
+ties).
+
+### Example
+
+```
+GET /v1/offramps?status=processing&customer_id=cust_seed_alice&page=1&per_page=50
+```
+
+
+
+
+# Execute an onramp
+Source: https://docs.globalstack.io/api-reference/onramps/execute-an-onramp
+
+/api-reference/openapi.json post /v1/onramps
+Execute an onramp from a previously created **onramp quote** to convert external fiat into crypto in a GlobalStack wallet.
+
+Supply the `quote_id` returned by `POST /v1/onramps/quotes`. `source_currency` and
+`destination_currency` are optional; when provided they must match the quote's
+currencies exactly, otherwise the request is rejected with `400 invalid_input`.
+
+An expired quote returns `409 invalid_status`.
+
+Send an `Idempotency-Key` header to make retries safe: an identical key with an
+identical body within 24h replays the original response.
+
+
+
+
+# Fetch an onramp
+Source: https://docs.globalstack.io/api-reference/onramps/fetch-an-onramp
+
+/api-reference/openapi.json get /v1/onramps/{onrampId}
+Fetches a single onramp by its external id (prefixed `onr_`).
+
+### Path parameter
+
+- `id` — required. The onramp's external id (e.g. `onr_01KPBH802PXQQXT8ASJGE0QX2K`).
+  A value that is not a valid `onr_…` id returns `400`. An id that does not exist returns `404`.
+
+### Example
+
+```
+GET /v1/onramps/onr_01KPBH802PXQQXT8ASJGE0QX2K
+```
+
+
+
+
+# List onramps
+Source: https://docs.globalstack.io/api-reference/onramps/list-onramps
+
+/api-reference/openapi.json get /v1/onramps
+List onramps, newest first. Results are scoped to
+the authenticated integration.
+
+All filters are optional. With no filters every onramp for the integration is
+returned (paginated).
+
+### Filter behavior
+
+- `customer_id` — restricts to onramps for a single customer. Must be a valid
+  `cust_…` id. An unknown id returns an empty page (`200`,
+  `data: []`), not `404`.
+- `status` — restricts to a single lifecycle status. One of `created`,
+  `awaiting_deposit`, `processing`, `temporary_failure`, `success`, `failed`,
+  `returned`.
+- `created_after` / `created_before` — either a `YYYY-MM-DD` calendar date (UTC,
+  inclusive: `created_after` matches at or after `00:00:00`, `created_before` at
+  or before `23:59:59.999`) or a full ISO 8601 UTC timestamp ending in `Z`
+  (e.g. `2026-04-16T16:16:03Z`), used as the exact instant.
+
+### Pagination
+
+- `page` — 1-indexed page number. Defaults to `1`. Must be between `1` and `1,000,000`.
+- `per_page` — page size. Defaults to `50`. Must be between `1` and `200`.
+
+The response carries pagination metadata under `meta`:
+
+```json
+"meta": {
+  "request_id": "req_...",
+  "timestamp": "...",
+  "version": "1",
+  "page": 1,
+  "per_page": 50,
+  "total": 137,
+  "has_more": true
+}
+```
+
+`has_more` is `true` when at least one more page is available.
+
+### Ordering
+
+Results are sorted by `created_at DESC, id DESC` (newest first, deterministic on
+ties).
+
+### Example
+
+```
+GET /v1/onramps?status=awaiting_deposit&customer_id=cust_seed_alice&page=1&per_page=50
+```
+
+
+
+
+# Pagination
+Source: https://docs.globalstack.io/api-reference/pagination
+
+Page through list endpoints with page and per_page.
+
+List endpoints return results in pages. Control the window with two query parameters:
+
+| Parameter  | Description                             |
+| ---------- | --------------------------------------- |
+| `page`     | 1-indexed page number. Defaults to `1`. |
+| `per_page` | Number of results per page.             |
+
+```bash theme={null}
+curl "https://api.globalstack.io/v1/transactions?page=2&per_page=50" \
+  -H "Authorization: Bearer YOUR_SECRET_KEY"
+```
+
+## Reading the page metadata
+
+Paginated responses carry the page state in `meta`:
+
+```json theme={null}
+{
+  "status": true,
+  "message": "Transactions retrieved",
+  "code": "ok",
+  "data": [ ... ],
+  "meta": {
+    "page": 2,
+    "per_page": 50,
+    "total": 137,
+    "has_more": true,
+    "request_id": "req_01HXYZ4K5ABCDEFGHJKLMNPQRS",
+    "timestamp": "2026-05-14T15:43:55.732Z",
+    "version": "1"
+  }
+}
+```
+
+Keep requesting the next page while `has_more` is `true`; `total` tells you the full count of matching records.
+
+<Tip>
+  Combine pagination with the filters available on each list endpoint (for example `customer_id`, `status`, `created_after`, `created_before`) to narrow results before paging.
+</Tip>
+
+
+# Create a conversion quote
+Source: https://docs.globalstack.io/api-reference/quotes/create-a-conversion-quote
+
+/api-reference/openapi.json post /v1/conversions/quotes
+Creates a **conversion quote** — a short-lived, priced offer to convert the balance
+of one wallet (`source_wallet_id`) into another wallet (`destination_wallet_id`).
+
+The source wallet's currency (e.g. `USDC`) is the source; the destination wallet's
+currency (e.g. `NGN`) is the destination — the two currencies must differ. `source_network` and `destination_network` are each derived from the
+respective wallet's newest active credential, defaulting to `solana` when a crypto wallet has no active credential (a fiat wallet with no active credential is
+rejected). `reference` is optional and echoed back as the quote `reference`. The
+response carries the source wallet in `wallet_id` and the destination wallet in
+`destination_wallet_id`.
+
+The quote is created with `status: active` and an `expires_at` in the near future.
+
+Specify **either** `source_amount` (the source-wallet amount converted) **or**
+`target_amount` (the amount credited to the destination wallet) — exactly one, each a
+positive decimal string. Providing both, or neither, is rejected with a 400. When
+`target_amount` is supplied, we compute and return the required `source_amount` on the quote.
+
+USDC amounts settle in whole US cents: `source_amount` may carry at most **2 significant
+decimal places**. Trailing zeros are fine — `2.980000` is accepted, `2.980228` is rejected
+with `400 invalid_amount_precision`. This precision check applies only when you supply
+`source_amount`; a `target_amount`-driven quote is not constrained this way.
+
+
+
+
+# Create an offramp quote
+Source: https://docs.globalstack.io/api-reference/quotes/create-an-offramp-quote
+
+/api-reference/openapi.json post /v1/offramps/quotes
+Creates an **offramp quote** — a short-lived, priced offer to convert the crypto
+held by the wallet identified by `wallet_id` into fiat paid out to `beneficiary_id`.
+
+The wallet's own currency (e.g. `USDC`) is the source; the beneficiary's currency
+(e.g. `NGN`) is the destination. `source_network` is derived from a credential on
+the wallet; `destination_network` is the beneficiary's payout rail. The beneficiary
+must belong to the same customer as the wallet. `narration` is optional and echoed
+back as the quote `reference`.
+
+The quote is created with `status: active` and an `expires_at` in the near future.
+
+You can optionally pass `source_currency` and `destination_currency` as consistency checks — if they do not match the wallet or beneficiary, we reject the request immediately.
+
+Specify **either** `source_amount` (the crypto amount converted) **or** `target_amount`
+(the fiat amount the beneficiary receives) — exactly one, each a positive decimal string.
+Providing both, or neither, is rejected with a 400. When `target_amount` is supplied, we
+compute and return the required `source_amount` on the quote.
+
+USDC amounts settle in whole US cents: `source_amount` may carry at most **2 significant
+decimal places**. Trailing zeros are fine — `2.980000` is accepted, `2.980228` is rejected
+with `400 invalid_amount_precision`. This precision check applies only when you supply
+`source_amount`; a `target_amount`-driven quote is not constrained this way.
+
+
+
+
+# Create an onramp quote
+Source: https://docs.globalstack.io/api-reference/quotes/create-an-onramp-quote
+
+/api-reference/openapi.json post /v1/onramps/quotes
+Creates an **onramp quote** — a short-lived, priced offer to convert fiat into the
+crypto held by the wallet identified by `wallet_id`.
+
+`source_currency` is the fiat being paid in (e.g. `NGN`); the wallet's own currency
+(e.g. `USDC`) is the destination. `source_network` is the fiat rail (e.g. `bank`,
+`mobile_money`). `destination_network` is optional — when omitted it is derived from
+the wallet's newest active credential, defaulting to `solana` when the wallet has no
+active credential; when supplied it must be a network the wallet currency supports.
+
+`country_code` (optional, ISO 3166-1 alpha-2, e.g. `NG`) disambiguates
+`source_currency` when the same code is supported in multiple countries. If the code
+is only supported in one country, `country_code` can be omitted. If the code is
+supported in two or more countries and `country_code` is omitted, the request is
+rejected with a 400 listing the available countries. `country_code` no longer needs
+to match the customer's registered country — the payer may transact from a country
+other than their KYC country.
+
+`phone_number` (optional, international/E.164 format) and `provider_id` (optional,
+a `prov_…` id) are accepted. When `source_network` is `mobile_money`, a payer phone
+must be resolvable — either `phone_number` is supplied or the customer has a phone on
+their profile — and `provider_id` is required.
+
+`full_name` (optional, 2–128 characters) is the full name of the phone owner. It is
+required when `source_network` is `mobile_money` **and** either `phone_number` is
+supplied on the request (the phone owner may differ from the customer) **or** the
+customer is a business (whose sender payload otherwise carries no individual name).
+`full_name` is stored on the quote's metadata under `fullName` and forwarded to the
+payout rail as the sender name. Supplying `full_name` on a non-mobile-money onramp
+is rejected with a 400.
+
+`reference` is optional and echoed back as the quote `reference`.
+
+Specify **either** `source_amount` (the fiat amount paid in) **or** `target_amount`
+(the crypto amount the recipient receives) — exactly one, each a positive decimal
+string. Providing both, or neither, is rejected with a 400. When `target_amount` is
+supplied, we compute and return the required `source_amount` on the quote.
+
+The quote is created with `status: active` and an `expires_at` in the near future.
+
+
+
+
+# Fetch a quote
+Source: https://docs.globalstack.io/api-reference/quotes/fetch-a-quote
+
+/api-reference/openapi.json get /v1/quotes/{quoteId}
+Fetch a quote by ID. Use this after you create a quote with `POST /v1/onramps/quotes`, `POST /v1/offramps/quotes`, or `POST /v1/conversions/quotes`.
+
+We return the full quote object for any lifecycle state (`active`, `consumed`, or `expired`).
+
+### Errors
+
+- `400 invalid_input` — `quote_id` does not start with `quo_`.
+- `404 not_found` — returned for **all** lookup misses.
+
+### Example
+
+```
+GET /v1/quotes/quo_01KPBK123456789ABCDEFG
+```
+
+
+
+
+# List countries
+Source: https://docs.globalstack.io/api-reference/supported-countries/list-countries
+
+/api-reference/openapi.json get /v1/countries/
+List countries where GlobalStack operates. Each row includes supported ISO currency codes and the payment networks available in that country.
+
+Use this as a starting point for coverage. For per-currency limits and capability flags, use `GET /v1/currencies`. For banks and mobile money operators you can pass as provider_id on fiat beneficiaries, use `GET /v1/countries/{country_code}/providers`.
+
+This is reference data — fetch once and cache client-side.
+
+All filters are optional.
+
+### Filter behavior
+
+- `currency` — restricts to countries that support the given currency code.
+  Matched case-insensitively and must satisfy `^[A-Z0-9]{2,10}$`.
+- `network` — restricts to countries that support the given settlement
+  network (e.g. `bank`).
+
+### Example
+
+```
+GET /v1/countries?currency=NGN&network=bank
+```
+
+
+
+
+# List network providers
+Source: https://docs.globalstack.io/api-reference/supported-countries/list-network-providers
+
+/api-reference/openapi.json get /v1/countries/{countryCode}/providers
+List network providers available in a country. Filter by `network` to narrow to banks, mobile money operators, or other payment networks.
+
+You need a `provider_id` when creating a fiat beneficiary — it tells us which bank or mobile money operator to route the payout through.
+
+Not every country returns rows. United States bank payouts use routing numbers on the beneficiary instead of a provider catalog, so you typically see an empty `data` array for `US`. Crypto networks are not country-scoped here.
+
+When you omit `network`, we return providers across all networks for this country.
+
+### Path parameters
+
+- `countryCode` — ISO 3166-1 alpha-2 country code (e.g. `NG`, `KE`).
+  Matched case-insensitively.
+
+### Query parameters
+
+- `network` *(optional)* — narrows the list to a single settlement network.
+- `active` *(optional, boolean)* — when `true`, returns only providers
+  currently accepting traffic.
+
+### Example
+
+```
+GET /v1/countries/NG/providers?network=bank&active=true
+```
+
+
+
+
+# Get currency rates
+Source: https://docs.globalstack.io/api-reference/supported-currencies/get-currency-rates
+
+/api-reference/openapi.json get /v1/currencies/{code}/rates
+Get buy and sell rates for a currency against every currency it pairs with directly.
+
+`buy` is the rate when you acquire the listed `currency` using the path code currency. sell is the rate when you dispose of the listed `currency` to receive the path currency. For fiat currencies the only pair is USDC. For USDC you receive one row per supported fiat. Fiat-to-fiat pairs are not listed here (they price through USDC internally).
+
+Values include a small mock spread and deterministic jitter so consecutive calls stay in a narrow band.
+
+Rates are quoted as decimal strings with two places — they are not numbers,
+to avoid floating-point precision loss for downstream callers handling
+financial amounts.
+
+### Path parameters
+
+- `code` — the currency code (e.g. `NGN`, `USDC`).
+
+### Query parameters
+
+- `country_code` *(optional)* — restricts the rates to a specific country
+  (ISO 3166-1 alpha-2). Useful for currencies that quote differently per
+  market.
+
+### Example
+
+```
+GET /v1/currencies/NGN/rates?country_code=NG
+```
+
+
+
+
+# List currencies
+Source: https://docs.globalstack.io/api-reference/supported-currencies/list-currencies
+
+/api-reference/openapi.json get /v1/currencies/
+List supported currencies with networks, directional transaction limits
+(inbound / outbound), capability flags (`can_onramp`, `can_offramp`,
+`can_deposit`, `can_convert`), and current conversion fees (`fees`) keyed by
+settlement network. Flag meaning depends on `type` — see the API overview.
+
+Each `fees.payment_methods` entry describes the tiered fee ladder and
+per-chain network fees for its settlement network, split by `offramp` /
+`onramp` when both directions are supported. `fees` is `null` for crypto
+currencies and when fee data is unavailable.
+
+Each row is unique by `code` plus `country_code` (for example every WAEMU
+country has its own `XOF` entry with its own networks and limits). Use filters
+to find currencies that support a given operation or network, then paginate
+with `page` and `per_page`.
+
+For which countries and networks we cover, start with `GET /v1/countries`. For
+banks and mobile money operators (`provider_id` on fiat beneficiaries), use
+`GET /v1/countries/{country_code}/providers` — not this resource.
+
+### Platform view vs customer view
+
+Without `customer_id`, the capability flags answer "can this be done on the
+platform" — they are the same for every caller.
+
+Pass the optional `customer_id` query parameter (a customer id, `cust_…`) and
+the same flags answer a narrower question: can **this customer** do this right
+now? Capabilities that depend on the customer's state are downgraded — today,
+fiat `can_deposit` reads `false` when the customer's KYC is not approved. The
+capability filters (`can_deposit=true`, …) are then evaluated against the
+customer's view too, so a filtered listing never advertises an operation the
+customer would be blocked from.
+
+Every downgraded row carries a `customer_restrictions` array explaining the
+downgrade. Each entry has:
+
+- `capability` — the capability that was removed (e.g. `deposit`).
+- `reason` — a stable machine code (e.g. `customer_kyc_not_approved`).
+- `next_steps` — `{ action, docs_url }` with what to do about it.
+
+`customer_restrictions` entries are the exact diff between the platform view
+and the customer view: they appear **only** for capabilities the platform
+supports (`true` at platform level) that the customer's state removes. A
+capability that is `false` at platform level is never annotated, and the field
+is omitted entirely on rows with no downgrade and in the platform view.
+
+An unknown `customer_id`, or one belonging to another integration, returns
+404 `not_found`; a malformed one returns 400 `invalid_input`. See the full
+[customer restrictions reference](https://docs.globalstack.io/api-reference/customer-restrictions)
+for all restriction reasons.
+
+### Filter behavior
+
+- `code` — filter by ISO currency code (e.g. `XOF` returns all WAEMU country
+  rows).
+- `type` — `fiat` or `crypto`.
+- `country_code` — filter by ISO 3166-1 alpha-2 country code.
+- `customer_id` — customer id (`cust_…`). Switches the listing to that
+  customer's view (see above).
+- `can_onramp` — boolean. Currencies that can participate in onramps. For
+  fiat, usable as onramp source; for crypto, as onramp destination.
+- `can_offramp` — boolean. Currencies that can participate in offramps. For
+  fiat, usable as offramp destination; for crypto, as offramp source.
+- `can_deposit` — boolean. Currencies that can participate in deposits
+  (typically crypto only).
+- `can_convert` — boolean. Currencies that participate in wallet-to-wallet
+  conversions.
+- `network` — only currencies that include this network in their `networks`
+  array.
+- `min_inbound_amount` — decimal string. Only currencies where at least one
+  network has inbound min less than or equal to this value.
+- `max_inbound_amount` — decimal string. Only currencies where at least one
+  network has inbound max greater than or equal to this value.
+- `min_outbound_amount` — decimal string. Only currencies where at least one
+  network has outbound min less than or equal to this value.
+- `max_outbound_amount` — decimal string. Only currencies where at least one
+  network has outbound max greater than or equal to this value.
+- `page` — integer, 1-indexed page number.
+- `per_page` — integer page size (max 200).
+
+### Example
+
+```
+GET /v1/currencies?type=fiat&can_offramp=true
+```
+
+
+
+
+# List the calling merchant's currency access requests
+Source: https://docs.globalstack.io/api-reference/supported-currencies/list-the-calling-merchants-currency-access-requests
+
+/api-reference/openapi.json get /v1/currencies/access-requests
+List the calling merchant's currency access requests, newest first.
+
+
+
+
+# Request access to a gated currency
+Source: https://docs.globalstack.io/api-reference/supported-currencies/request-access-to-a-gated-currency
+
+/api-reference/openapi.json post /v1/currencies/{code}/access-requests
+Request access to a currency that is gated behind `requires_access = true`.
+
+The currency is resolved from the `:code` path parameter and the optional
+`country_code` body field. When `country_code` is omitted, the code must resolve
+to exactly one currency; if the same code exists for more than one country, the
+request is rejected with `invalid_input` and you must supply `country_code` to
+disambiguate.
+
+
+
+
+# Get a transaction
+Source: https://docs.globalstack.io/api-reference/transactions/get-a-transaction
+
+/api-reference/openapi.json get /v1/transactions/{transactionId}
+Fetch a transaction by its txn_… external id, scoped to the authenticated merchant. Returns 404 not_found when the id is unknown.
+
+
+
+# List transactions
+Source: https://docs.globalstack.io/api-reference/transactions/list-transactions
+
+/api-reference/openapi.json get /v1/transactions
+Unified view across `onramps`, `offramps`, `conversions`, `deposits`, and `transfers` for reconciliation and history.
+
+Filter by `type`, `source_type` (for deposits), `customer_id`, `wallet_id`, `status`, `source_currency`, and `created_after` / `created_before`. Results are paginated with page and per_page (max 200).
+
+### Filter behavior
+
+- `type` — coarse category. One of `onramp`, `offramp`, `conversion`,
+  `transfer`, `deposit`.
+- `source_type` — granular origin. One of  `deposit_address`, `credential`,
+  `deposit_forward`.
+- `customer_id` — restricts to a single customer. Must be a valid `cust_…` id.
+  An unknown id returns an empty page (`200`, `data: []`),
+  not `404`.
+- `wallet_id` — matches transactions where the wallet is either the source
+  (`from_wallet_id`) or the destination (`to_wallet_id`). Must be a valid
+  `wal_…` id. Unknown returns an empty page.
+- `status` — one of `created`, `awaiting_deposit`, `processing`,
+  `temporary_failure`, `success`, `failed`, `returned`, `received`, `confirmed`.
+- `source_currency` — exact currency-code match (e.g. `NGN`, `USDC`).
+- `created_after` / `created_before` — either a `YYYY-MM-DD` calendar date (UTC,
+  inclusive: `created_after` matches at or after `00:00:00`, `created_before` at
+  or before `23:59:59.999`) or a full ISO 8601 UTC timestamp ending in `Z`
+  (e.g. `2026-04-16T16:16:03Z`), used as the exact instant.
+
+### Pagination
+
+- `page` — 1-indexed page number. Defaults to `1`. Between `1` and `1,000,000`.
+- `per_page` — page size. Defaults to `50`. Between `1` and `200`.
+
+
+
+
+# Execute a transfer
+Source: https://docs.globalstack.io/api-reference/transfers/execute-a-transfer
+
+/api-reference/openapi.json post /v1/transfers
+Execute a **crypto transfer**: pay out crypto from one of your wallets to a crypto
+beneficiary on the wallet's currency and network. This is the crypto outbound equivalent of an offramp.
+
+`amount` is
+a decimal string within the currency network's outbound range. `source_currency` and
+`destination_currency` are optional; when supplied they must match the wallet and
+beneficiary currencies respectively, otherwise the request is rejected with
+`400 invalid_input`. `reference` is your idempotency reference and must be unique
+within your integration; a reused reference returns `409 duplicate_resource`.
+
+The transfer is created in the `processing` state and advances asynchronously
+(`processing` → `success`/`failed`). Send an `Idempotency-Key` header to make
+retries safe.
+
+USDC amounts settle in whole US cents: `amount` may carry at most **2 significant
+decimal places**. Trailing zeros are fine — `2.980000` is accepted, `2.980228` is rejected
+with `400 invalid_amount_precision`.
+
+
+
+
+# Fetch a transfer
+Source: https://docs.globalstack.io/api-reference/transfers/fetch-a-transfer
+
+/api-reference/openapi.json get /v1/transfers/{transferId}
+Fetch a single transfer by its `tfr_…` id. Returns `404 not_found` when the transfer does not exist.
+
+
+
+
+# List transfers
+Source: https://docs.globalstack.io/api-reference/transfers/list-transfers
+
+/api-reference/openapi.json get /v1/transfers
+List transfers, most recent first. Filter by `customer_id`
+(the sender/wallet owner), `status`, and a `created_after`/`created_before`
+date range. Each date filter accepts either a `YYYY-MM-DD` calendar date (UTC,
+inclusive of the full day) or a full ISO 8601 UTC timestamp ending in `Z`
+(used as the exact instant). Paginate with `page` and `per_page`.
+
+
+
+
+# Create a wallet
+Source: https://docs.globalstack.io/api-reference/wallets/create-a-wallet
+
+/api-reference/openapi.json post /v1/wallets
+Create a wallet — a ledger balance in a single currency for a customer.
+
+This does not create a credential. Add funding rails later with `POST /v1/wallets/:id/credentials` when you need a persistent receive identity. You can still onramp into a wallet with zero credentials.
+
+If `customer_id` is omitted, the wallet is created for the merchant.
+The currency must support deposit (`can_deposit = true`).
+
+`country_code` (optional, ISO 3166-1 alpha-2, e.g. `NG`) pins the wallet to a country
+at creation. It is required only when the same `currency` code is supported in more than
+one country; a single-country currency code (like `KES` in `KE`) resolves without it. CRYPTO
+currencies (like `USDC`) always resolve to `null` — supplying `country_code` for a crypto
+code has no effect. The pinned country is persisted on the wallet, echoed on every wallet
+response as `country_code`, and used by downstream flows (quotes, deposit-addresses) instead
+of the customer's registered country — so a wallet can serve payers who transact from a
+country other than the customer's KYC country.
+
+Balances start at zero, formatted to the currency's precision. A customer may
+hold multiple wallets in the same crypto currency, but only one wallet per fiat
+currency; each create returns a new wallet with its own `wal_…` id. Use the
+optional `label` to tell them apart.
+
+### Wallet type
+
+`type` chooses the wallet's shape and is fixed at creation.
+
+- `custodial` (default) — the wallet holds a balance. Deposits credit it, and you convert,
+  offramp and transfer out of it. This is how every wallet behaved before `type` existed, so
+  omitting `type` keeps current behaviour.
+- `forwarding` — the wallet holds no balance. Every inflow is delivered straight to
+  `destination_address` on `destination_chain`, an address you control.
+
+A forwarding wallet requires a crypto currency and both destination fields. Its balances always
+read zero, and it cannot be the source of a transfer, offramp or conversion — those return
+`400 invalid_input`. Neither destination field can be changed afterwards: create a new wallet to
+change where funds land.
+
+### Body
+
+- `currency` — required. 2-8 uppercase alphanumerics (e.g. `USDC`, `NGN`).
+- `country_code` — optional. 2-letter uppercase ISO 3166-1 alpha-2 (e.g. `NG`).
+- `customer_id` — Owner customer ID. If omitted, defaults to your account's default customer — created automatically when you signed up.
+- `type` — optional. `custodial` (default) or `forwarding`.
+- `destination_address` — required when `type` is `forwarding`, rejected otherwise. Max 128 chars,
+  validated against `destination_chain` (EVM chains expect `0x` + 40 hex; Solana expects a base58
+  address).
+- `destination_chain` — required when `type` is `forwarding`, rejected otherwise. One of `solana`,
+  `base`, `ethereum`, and must be supported by `currency`.
+- `label` — optional. Max 255 chars.
+- `metadata` — optional. Free-form `Record<string, string>`.
+
+### Owner
+
+`data.customer` is the customer that owns the wallet, returned on every wallet payload:
+
+| Field | Description |
+| ----- | ----------- |
+| `id` | Customer external id (`cust_…`), identical to `customer_id`. |
+| `type` | `individual` or `business`. |
+| `name` | Customer full or business name. |
+| `email` | Customer email address. |
+| `tier` | KYC tier — `tier_0`, `tier_1` or `tier_2`. |
+| `created_at` / `updated_at` | ISO-8601 timestamps. |
+
+`customer_id` is unchanged and still present. For KYC status, metadata or the customer profile,
+call `GET /v1/customers/{customerId}`.
+
+### Errors
+
+- `400 invalid_input` (was `404 not_found` before XB-1154) — `currency 'X' is not
+  supported`. The code isn't in the supported currency table at all.
+- `400 invalid_input` — `currency 'X' is not supported in country 'Y'`. The code
+  exists but the supplied `country_code` doesn't match any row.
+- `400 invalid_input` — `currency 'X' is available in multiple countries (A, B);
+  country_code is required`. Supply the pin to disambiguate.
+
+### Example
+
+```
+POST /v1/wallets
+{
+  "currency": "USDC"
+}
+```
+
+```
+POST /v1/wallets
+{
+  "currency": "NGN",
+  "country_code": "NG"
+}
+```
+
+A forwarding wallet — every deposit is delivered to your own address on Base:
+
+```
+POST /v1/wallets
+{
+  "currency": "USDC",
+  "type": "forwarding",
+  "destination_address": "0x1111111111111111111111111111111111111111",
+  "destination_chain": "base"
+}
+```
+
+
+
+
+# Create a wallet credential
+Source: https://docs.globalstack.io/api-reference/wallets/create-a-wallet-credential
+
+/api-reference/openapi.json post /v1/wallets/{id}/credentials
+Create a fiat or crypto funding credential on a wallet identified
+by the `wal_…` id in the path.
+
+## Same-currency credentials (default)
+
+By default the credential's currency matches the wallet's currency — deposits
+land directly on the wallet balance. `network` must be a network supported by
+the wallet's currency (e.g. `base`, `ethereum`, `solana` for crypto). For fiat
+credentials only `bank` is supported today — even if the wallet's currency
+advertises other fiat networks (e.g. `mobile_money`), a non-`bank` network is
+rejected with `invalid_input`. `type` is optional — when omitted it is derived
+from the wallet's currency; when supplied it must match the wallet's currency
+type. `merchantReference` is optional and is generated when not provided.
+
+## Cross-currency credentials (auto-onramp / auto-offramp)
+
+Passing an explicit `currency` different from the wallet's currency creates a
+cross-currency credential. Every deposit is automatically converted into the
+wallet's currency at the FX rate live at deposit time:
+
+- **Auto-onramp** — a fiat currency on a crypto wallet (e.g. `NGN` on a `USDC`
+  wallet). The payer sends fiat; the wallet is credited in crypto.
+- **Auto-offramp** — a crypto currency on a fiat wallet (e.g. `USDC` on an
+  `NGN` wallet). The payer sends crypto; the wallet is credited in fiat.
+
+Only crypto↔fiat pairs are supported — a crypto credential on a crypto wallet
+(or fiat on fiat) is rejected. Both currencies in the pair must have matching capabilities: `canOnramp` for auto-onramp, `canOfframp` for
+auto-offramp. `network` is validated against the **credential's own** currency,
+not the wallet's — so an `NGN` credential on a `USDC` wallet uses `bank`, and a
+`USDC` credential on an `NGN` wallet uses `base` / `ethereum` / `solana`.
+
+## Disambiguating multi-country currencies (`country_code`)
+
+Some fiat currency codes exist for more than one country (e.g. `XOF` for CFA-franc
+countries). Pass an ISO 3166-1 alpha-2 `country_code` to pin which country's
+currency the credential should hold:
+
+- **Cross-currency** — when `currency` resolves to multiple country rows and no
+  `country_code` is supplied, the request is rejected with `invalid_input` and
+  the response message lists the available countries. When `country_code` is
+  supplied, the credential currency is pinned to that country (falling back to
+  the null-country row for crypto codes).
+- **Same-currency** — the credential inherits the wallet's currency and its
+  country, so no lookup happens. If `country_code` is supplied it must equal the
+  parent wallet's country or the request is rejected with `invalid_input`.
+
+
+
+
+# Create a wallet deposit address
+Source: https://docs.globalstack.io/api-reference/wallets/create-a-wallet-deposit-address
+
+/api-reference/openapi.json post /v1/wallets/{id}/deposit-addresses
+Create an on-chain receive address on a wallet for external crypto deposits.
+
+Pass type (`crypto` today) and `network` for the target chain. `currency` is inferred from the wallet. Optional `label` and `metadata` help you reconcile addresses in your systems.
+
+
+When funds arrive, a deposit transaction appears in GET /v1/transactions?type=deposit&source_type=deposit_address. We fire deposit.received and deposit.confirmed webhooks with the unified transaction object. Whether funds have arrived is tracked on the transaction, not on the address record.
+
+
+
+
+# Deactivate a wallet credential
+Source: https://docs.globalstack.io/api-reference/wallets/deactivate-a-wallet-credential
+
+/api-reference/openapi.json delete /v1/wallets/{id}/credentials/{credentialId}
+Deactivates a wallet credential by flipping its `status` to `disabled`. The credential
+record is preserved — list and get continue to return it.
+
+The path ids are GlobalStack external identifiers: the wallet (`wal_…`) and the credential
+(`wcr_…`).
+
+An optional JSON body `{ "reason": "…" }` (max 255 chars) records why the credential was
+deactivated in `disabled_reason`.
+
+### Response
+
+```json
+{
+  "status": true,
+  "message": "Wallet credential has been successfully deactivated",
+  "code": "ok",
+  "data": { "id": "wcr_01HXYZABC1234567890ABCDEFG", "success": true },
+  "meta": { "request_id": "req_…", "timestamp": "…", "version": "1" }
+}
+```
+
+### Status preconditions
+
+- `pending` → disabled.
+- `active` → disabled.
+- `frozen` → `409 invalid_status` (a merchant cannot clear an internal/compliance freeze).
+- `disabled` → `409 invalid_status` (not idempotent).
+
+### Errors
+
+- `400 invalid_input` — `wal_…` or `wcr_…` id is malformed.
+- `401 authentication_failed` — invalid or missing API key.
+- `404 not_found` — wallet or credential does not exist in this integration.
+- `409 invalid_status` — credential is already disabled or is frozen.
+
+### Example
+
+```
+DELETE /v1/wallets/wal_01HXYZABC1234567890ABCDEFG/credentials/wcr_01HXYZABC1234567890ABCDEFG
+```
+
+
+
+
+# Deactivate a wallet deposit address
+Source: https://docs.globalstack.io/api-reference/wallets/deactivate-a-wallet-deposit-address
+
+/api-reference/openapi.json delete /v1/wallets/{id}/deposit-addresses/{depositAddressId}
+Deactivates a wallet deposit address by flipping its `status` to `disabled`. The record is
+preserved — list and get continue to return it.
+
+The path ids are GlobalStack external identifiers: the wallet (`wal_…`) and the deposit address
+(`da_…`).
+
+An optional JSON body `{ "reason": "…" }` (max 255 chars) records why the deposit address was
+deactivated in `disabled_reason`.
+
+Funds sent to a deactivated address are not credited.
+
+### Response
+
+```json
+{
+  "status": true,
+  "message": "Deposit address has been successfully deactivated",
+  "code": "ok",
+  "data": { "id": "da_01HXYZABC1234567890ABCDEFG", "success": true },
+  "meta": { "request_id": "req_…", "timestamp": "…", "version": "1" }
+}
+```
+
+### Status preconditions
+
+- `pending` → disabled.
+- `active` → disabled.
+- `frozen` → `409 invalid_status`.
+- `disabled` → `409 invalid_status` (not idempotent).
+
+### Errors
+
+- `400 invalid_input` — `wal_…` or `da_…` id is malformed.
+- `401 authentication_failed` — invalid or missing API key.
+- `404 not_found` — wallet or deposit address does not exist in this integration.
+- `409 invalid_status` — deposit address is already disabled or is frozen.
+
+### Example
+
+```
+DELETE /v1/wallets/wal_01HXYZABC1234567890ABCDEFG/deposit-addresses/da_01HXYZABC1234567890ABCDEFG
+```
+
+
+
+
+# Fetch a wallet
+Source: https://docs.globalstack.io/api-reference/wallets/fetch-a-wallet
+
+/api-reference/openapi.json get /v1/wallets/{walletId}
+Returns a single wallet, including its credentials.
+
+The path id is the GlobalStack external identifier (`wal_…`) returned by
+`POST /v1/wallets` and `GET /v1/wallets`.
+
+### Credentials
+
+`data.credentials` lists the wallet's credentials, created via `POST /v1/wallets/{id}/credentials` — newest first. The array is empty when the wallet has no credentials.
+
+### Balances
+
+`available_balance`, `pending_balance`, and `total_balance` start at
+`0.00` (formatted to the currency precision).
+
+### Owner
+
+`data.customer` is the customer that owns the wallet, returned on every wallet payload:
+
+| Field | Description |
+| ----- | ----------- |
+| `id` | Customer external id (`cust_…`), identical to `customer_id`. |
+| `type` | `individual` or `business`. |
+| `name` | Customer full or business name. |
+| `email` | Customer email address. |
+| `tier` | KYC tier — `tier_0`, `tier_1` or `tier_2`. |
+| `created_at` / `updated_at` | ISO-8601 timestamps. |
+
+`customer_id` is unchanged and still present. For KYC status, metadata or the customer profile,
+call `GET /v1/customers/{customerId}`.
+
+### Errors
+
+- `400 invalid_input` — `wallet_id` does not start with `wal_`. This catches
+  callers passing a non-GlobalStack id (e.g. a `cust_…` id).
+- `404 not_found` — returned for **all** lookup misses: the id does not
+  exist.
+
+### Example
+
+```
+GET /v1/wallets/wal_seed_alice_usdc
+```
+
+
+
+
+# Fetch a wallet credential
+Source: https://docs.globalstack.io/api-reference/wallets/fetch-a-wallet-credential
+
+/api-reference/openapi.json get /v1/wallets/{id}/credentials/{credentialId}
+Returns a single credential by its `wcr_…` external id, scoped to the wallet
+identified by the `wal_…` id in the path.
+
+### Errors
+
+- `400 invalid_input` — the wallet id does not start with `wal_`, or the
+  credential id does not start with `wcr_`.
+- `404 not_found` — the wallet does not exist in this integration, or the
+  credential does not exist under that wallet. A single 404 covers every
+  miss path (unknown id, wrong wallet, wrong integration, wrong purpose).
+
+
+
+
+# Fetch a wallet deposit address
+Source: https://docs.globalstack.io/api-reference/wallets/fetch-a-wallet-deposit-address
+
+/api-reference/openapi.json get /v1/wallets/{id}/deposit-addresses/{depositAddressId}
+Returns a single deposit address by its `da_…` external id, scoped to the
+wallet identified by the `wal_…` id in the path.
+
+### Errors
+
+- `400 invalid_input` — the wallet id does not start with `wal_`, or the deposit
+  address id does not start with `da_`.
+- `404 not_found` — the wallet does not exist in this integration, or the
+  deposit address does not exist under that wallet. A single 404 covers every
+  miss path (unknown id, wrong wallet, wrong integration, wrong purpose).
+
+
+
+
+# List wallet credentials
+Source: https://docs.globalstack.io/api-reference/wallets/list-wallet-credentials
+
+/api-reference/openapi.json get /v1/wallets/{id}/credentials
+List funding credentials linked to a wallet. Each row is either `fiat` (bank) or `crypto` (on-chain receive identity).
+
+On create you pass `type`, `network`, `label`, and `metadata`. For crypto, we always generate the on-chain address. Responses include `currency`, a trimmed `wallet` summary (`id`, `currency`,`label`), plus `label`, `metadata`, and `details` (with `network` nested under `details`).
+
+### Pagination
+
+`page` is 1-indexed (default `1`, max `1_000_000`). `per_page` defaults to
+`50` (max `200`). `meta.has_more` is `true` when more results exist beyond
+the current page.
+
+### Errors
+
+- `400 invalid_input` — the path id does not start with `wal_`, or `page` /
+  `per_page` is non-numeric or outside the allowed range.
+- `404 not_found` — the wallet does not exist in this integration.
+
+
+
+# List wallet deposit addresses
+Source: https://docs.globalstack.io/api-reference/wallets/list-wallet-deposit-addresses
+
+/api-reference/openapi.json get /v1/wallets/{id}/deposit-addresses
+List deposit addresses for a wallet. Filter by `status` or `network`.
+
+To see inbound payments that arrived at these addresses, use `GET /v1/transactions?type=deposit&source_type=deposit_address`.
+
+
+### Filtering
+
+`status` is optional. When provided it must be one of `pending`, `active`,
+`frozen`, or `disabled`, and the result is narrowed to deposit addresses with
+that status. Omit it to return every status.
+
+### Pagination
+
+`page` is 1-indexed (default `1`, max `1_000_000`). `per_page` defaults to `50`
+(max `200`). `meta.has_more` is `true` when more results exist beyond the
+current page.
+
+### Errors
+
+- `400 invalid_input` — the path id does not start with `wal_`, `status` is not
+  a recognised value, or `page` / `per_page` is non-numeric or outside the
+  allowed range.
+- `404 not_found` — the wallet does not exist in this integration.
+
+
+
+# List wallets
+Source: https://docs.globalstack.io/api-reference/wallets/list-wallets
+
+/api-reference/openapi.json get /v1/wallets
+Returns the calling merchant's wallets, newest first.
+
+All filters are optional. When no filters are supplied all wallets are returned (paginated), across all customers.
+
+### Filter behavior
+
+- `customer_id` — restricts to a single customer's wallets. Must be a GlobalStack
+  `cust_…` id. 
+- `currency` — restricts to one currency code (exact, uppercase, e.g. `USDC`).
+
+### Pagination
+
+- `page` — 1-indexed page number. Defaults to `1`. Must be between `1` and `1,000,000`.
+- `per_page` — page size. Defaults to `20`. Must be between `1` and `50`. Capped
+  tighter than other list endpoints because each wallet is composed with a live
+  ledger balance.
+
+The response carries pagination metadata under `meta` (`page`, `per_page`,
+`total`, `has_more`). `has_more` is `true` when at least one more page is
+available.
+
+### Balances
+
+`available_balance`, `pending_balance`, and `total_balance` are sourced from the
+ledger and formatted to the currency's precision. Wallets that are not yet
+provisioned (`provisioned: false`) report zero balances.
+
+### Ordering
+
+Results are sorted by `created_at DESC, id DESC` (newest first, deterministic on ties).
+
+### Owner
+
+`data.customer` is the customer that owns the wallet, returned on every wallet payload:
+
+| Field | Description |
+| ----- | ----------- |
+| `id` | Customer external id (`cust_…`), identical to `customer_id`. |
+| `type` | `individual` or `business`. |
+| `name` | Customer full or business name. |
+| `email` | Customer email address. |
+| `tier` | KYC tier — `tier_0`, `tier_1` or `tier_2`. |
+| `created_at` / `updated_at` | ISO-8601 timestamps. |
+
+`customer_id` is unchanged and still present. For KYC status, metadata or the customer profile,
+call `GET /v1/customers/{customerId}`.
+
+### Example
+
+```
+GET /v1/wallets?customer_id=cust_01HXYZ…&currency=USDC&page=1&per_page=25
+```
+
+
+
+
+# Update a wallet
+Source: https://docs.globalstack.io/api-reference/wallets/update-a-wallet
+
+/api-reference/openapi.json patch /v1/wallets/{walletId}
+Partially updates an existing wallet. Returns the wallet in the same shape as
+`POST /v1/wallets`.
+
+The path id is the GlobalStack external identifier (`wal_…`).
+
+### Mutable fields
+
+- `label` — non-empty string, max 255 chars.
+- `metadata` — free-form `Record<string, string>`.
+
+### Immutable fields
+
+`currency` and `customer_id` cannot be changed. Including either (or any unknown
+field) in the request body fails validation with `400 bad_request`. To move a
+wallet to a different currency, create a new wallet.
+
+### Semantics
+
+- **`label`** is replace-only. Omitting it leaves the stored label unchanged.
+  Passing `null` (or an empty string) to clear it is rejected as `400 bad_request`.
+- **`metadata`** is replaced whole-cloth when present. No deep merge — the new
+  map fully replaces the stored map. `{}` clears it. Explicit `null` is rejected
+  as `400 bad_request`.
+- A body with neither `label` nor `metadata` is rejected as `400 invalid_input`
+  (nothing to update).
+
+### Owner
+
+`data.customer` is the customer that owns the wallet, returned on every wallet payload:
+
+| Field | Description |
+| ----- | ----------- |
+| `id` | Customer external id (`cust_…`), identical to `customer_id`. |
+| `type` | `individual` or `business`. |
+| `name` | Customer full or business name. |
+| `email` | Customer email address. |
+| `tier` | KYC tier — `tier_0`, `tier_1` or `tier_2`. |
+| `created_at` / `updated_at` | ISO-8601 timestamps. |
+
+`customer_id` is unchanged and still present. For KYC status, metadata or the customer profile,
+call `GET /v1/customers/{customerId}`.
+
+### Errors
+
+- `400 bad_request` — class-validator failures: an immutable or unknown field
+  (`currency`, `customer_id`, …) rejected; `label` set to
+  null/empty; `metadata` set to `null` or a non-object.
+- `400 invalid_input` — malformed path id (`wal_…` prefix required); empty
+  patch body with neither `label` nor `metadata`.
+- `401 authentication_failed` — invalid or missing API key.
+- `404 not_found` — wallet does not exist.
+
+### Example
+
+```
+PATCH /v1/wallets/wal_01HXYZABC1234567890ABCDEFG
+{
+  "label": "Treasury Wallet"
+}
+```
+
+
+
+
+# Changelog
+Source: https://docs.globalstack.io/changelog
+
+Notable changes to the GlobalStack API — new endpoints, behavior changes, and new error and failure codes.
+
+Changes that affect how you integrate: new endpoints and fields, behavior changes, and new error
+or failure codes. Breaking changes are called out explicitly.
+
+<Update label="2026-10-20">
+  ## Small cross-currency deposits now accumulate instead of failing
+
+  On a [cross-currency credential](/api-reference/auto-conversion), a conversion is now quoted only
+  once the credential's balance clears the corridor's minimum convertible amount — and it is sized
+  from the **whole available balance**, not from the deposit that triggered it.
+
+  Two 3,000 NGN deposits into a credential with a 4,500 NGN minimum now convert together as one
+  6,000 NGN conversion when the second arrives. Previously each deposit was converted in isolation,
+  so a deposit under the minimum was refused by the FX provider and its funds sat on the credential
+  until support drained them. The same accumulation means a conversion that *fails* is no longer
+  stranded either: the next deposit into that credential converts the leftover along with itself.
+
+  **What changes in your integration.** `deposit.received` on this path can now carry a `null`
+  `destination_amount`, with `metadata.conversion_pending_reason` explaining why — `below_minimum`
+  (with `metadata.conversion_minimum`), `fx_rejected`, or `deferred`. That field was already
+  nullable for a deposit held by a tier limit; this is a second, more common cause. **Treat `null`
+  as "not converted yet", never as zero.** No `conversion.*` events follow such a deposit until a
+  later one converts the balance.
+
+  **One thing to watch.** Because the aggregate lands on the deposit that triggers the conversion,
+  that deposit's `destination_amount` can exceed its own `source_amount`, and the deposits folded
+  into it carry `null`. Summing `destination_amount` across deposits will not reconcile a
+  credential — reconcile against the `conversion.*` events, which stay one-per-conversion. The new
+  `metadata.converted_source_amount` tells you how much a given conversion actually converted.
+
+  No endpoint, request shape or response shape changed, and same-currency credentials are
+  unaffected. You can read a corridor's minimum from `GET /v1/currencies` as
+  `networks[].inbound.min` on the credential's currency, for the credential's `network`.
+</Update>
+
+<Update label="2026-10-13">
+  ## Transactions now carry `received_amount` — what actually landed
+
+  `GET /v1/transactions` and `GET /v1/transactions/{transactionId}` now return `received_amount`:
+  the amount the recipient actually received, formatted to the destination currency's precision.
+
+  This closes a gap. `destination_amount` on a transaction is the amount **quoted**, and on
+  corridors that charge a transaction fee separately that figure is the amount *before* the fee —
+  an off-ramp quoted at 110 ZAR can credit the recipient's bank 100. The real figure was already
+  on `GET /v1/onramps/{onrampId}`, `GET /v1/offramps/{offrampId}` and
+  `GET /v1/conversions/{conversionId}`, but reading it from a transactions list meant a follow-up
+  request per row. Now it is on the transaction itself, and on each entry in
+  `related_transactions`.
+
+  **When it is `null`.** For onramp, offramp and conversion transactions, `received_amount` is
+  `null` until the transaction reaches a terminal success, and stays `null` on one that did not
+  pay out. Only a settled payout has a delivered amount; before then there is nothing to report,
+  and we would rather say so than hand back the quote dressed up as a result. **Treat `null` as
+  "not known yet", never as zero** — while a transaction is in flight, `destination_amount`
+  remains your best estimate of what will be delivered.
+
+  **When it equals `destination_amount`.** On rails where nothing is deducted — deposits, and
+  funds returned to your wallet — the two are the same by definition, and `received_amount` simply
+  mirrors `destination_amount`. Reading `received_amount` is therefore safe across every
+  transaction type; you do not need to branch on `source_type` to know which field to trust.
+
+  **Reconciling against the quote.** Compare `received_amount` with `destination_amount` to see
+  the gap a transaction fee opened up. `destination_amount` is unchanged and still the quoted
+  figure, so nothing you already read has shifted.
+
+  **One exception worth knowing: cross-currency deposits.** On an auto-converted deposit,
+  `destination_amount` is priced from the quote at deposit time, so the `received_amount` that
+  mirrors it is a quote-time figure too — not a settled one. The amount that actually landed is
+  `actual_destination_amount` on the matching `conversion.success` event. Reconcile those against
+  the conversion, as you do today; `received_amount` on the deposit is for display, not for
+  settlement.
+
+  Deposit webhooks carry the field too — their `event_object` *is* the transaction record — so
+  `deposit.received`, `deposit.held`, `deposit.confirmed` and `deposit.failed` all include it.
+  See [Webhook events](/webhooks/events) for the full payloads.
+</Update>
+
+<Update label="2026-10-08">
+  ## Pay businesses over PayShap by ShapName
+
+  A PayShap beneficiary can now be addressed by a **ShapName** as well as a mobile number. A
+  ShapName is the `name@bank` identifier that businesses usually register for PayShap, for example
+  `acme@nedbank`. Put it in `account_number`, exactly as the recipient gives it, including the part
+  after `@`:
+
+  ```json theme={null}
+  {
+    "type": "fiat",
+    "name": "Acme Trading",
+    "label": "Acme supplier",
+    "currency": "ZAR",
+    "country_code": "ZA",
+    "network": "bank",
+    "rail": "payshap",
+    "account_number": "acme@nedbank"
+  }
+  ```
+
+  Everything else works as it does for a mobile number:
+
+  * We resolve the ShapName before we create the beneficiary. For a business, `account_name` is
+    the registered business name.
+  * An unregistered ShapName returns [`400 invalid_input`](/errors#invalid_input), and no
+    beneficiary is created.
+  * A value that cannot be a ShapName also returns `400 invalid_input`: nothing before or after
+    the `@`, more than one `@`, or a space inside it.
+
+  Mobile-number proxies are unchanged.
+</Update>
+
+<Update label="2026-10-08">
+  ## Fiat deposits now name the sender, and onramps report the payout hash
+
+  Two additions to what you already receive. Both are additive and optional — nothing you read
+  today has changed shape.
+
+  ### Who sent a fiat deposit
+
+  A deposit into a fiat credential now carries the payer in `metadata`, on both the `deposit.*`
+  webhook and `GET /v1/transactions/{id}`:
+
+  ```json theme={null}
+  "metadata": {
+    "sender_account_name": "JOHN DOE",
+    "sender_bank_name": "GTBank",
+    "sender_account_number": "2813"
+  }
+  ```
+
+  Enough to reconcile an unreferenced transfer, or to show a human who paid, without asking your
+  customer.
+
+  **A key you do not see was not reported.** Keys are omitted rather than blank, so check for
+  presence instead of comparing against `""` — banks report these inconsistently, and you may get
+  the name without the bank, or nothing at all. `sender_account_number` is the **last 4 digits**,
+  always: use it to help someone recognise a payment, not as an account identifier.
+
+  One case worth knowing: on deposits into a Paystack NGN virtual account, the bank and account
+  describe the virtual account the money landed in, while the name is the payer's. That rail does
+  not expose the payer's own bank details to us, and we would rather say so than guess.
+
+  Crypto deposits are unchanged — the on-chain `from_address` in `metadata` is the equivalent.
+
+  ### The onramp payout hash
+
+  `onramp.success` now carries `transaction_hash` in `event_object`: the on-chain hash of the
+  payout that delivered your crypto, so you can link a settlement to a block explorer without
+  asking us for it.
+
+  **Present or absent, never `null`.** It appears on onramps and effectively nowhere else — an
+  offramp pays a bank account and has no on-chain leg, and a conversion between two of your own
+  balances moves nothing on-chain. Some onramp rails also settle before a hash exists. So write
+  your handler to tolerate the key being missing.
+
+  **Store it when you receive it.** This webhook is the only place it appears — `GET
+    /v1/onramps/{id}` does not return it, and a hash that reaches us after the terminal event does
+  not trigger a second webhook, because an onramp delivers `onramp.success` exactly once.
+
+  See [Webhook events](/webhooks/events) for the full payloads.
+</Update>
+
+<Update label="2026-10-07">
+  ## Failed transactions now tell you why: `quote_expired`, `refund_failed`, `returned`
+
+  A conversion, onramp, or offramp that ended badly used to report one thing no matter what
+  happened: `failure_reason: "failed"`, *"This transaction could not be completed."* A quote nobody
+  funded, which simply expired, was indistinguishable from something breaking mid-processing — which
+  inflated apparent failure rates and misrouted alerting. Three new codes separate them.
+
+  | `failure_reason` | When                                                                          |
+  | ---------------- | ----------------------------------------------------------------------------- |
+  | `quote_expired`  | The payment never arrived before the quote expired. No funds moved.           |
+  | `refund_failed`  | The transaction failed, and the refund attempt did not complete.              |
+  | `returned`       | The transaction was returned and any funds debited for it have been released. |
+
+  **`quote_expired` is the common one** — by a wide margin. It means nobody paid in time, not that
+  anything went wrong on our side. No funds moved, so it is always safe to create a fresh quote and
+  try again. If you alert on failures, this is the code to exclude.
+
+  **This can change what you already receive.** Cases that previously arrived as `failed` now arrive
+  as `quote_expired`, `refund_failed`, or `returned`. Nothing was removed and no field changed shape
+  — but if you branch on `failure_reason === "failed"`, that branch will stop catching them. `failed`
+  remains the generic catch-all for anything we do not surface specifically.
+
+  **`returned` is the one that is not a `failed` status.** The other codes accompany
+  `status: "failed"`; `returned` accompanies `status: "returned"`, which is its own terminal state.
+  If you only read `failure_reason` when `status` is `"failed"`, you will not see it — gate on the
+  transaction not having succeeded instead.
+
+  Note that `returned` deliberately does not promise a credit. Whether funds come back depends on how
+  far the transaction got: an offramp whose payout had already settled is credited back in full,
+  while one that never debited you has nothing to return. Check your balance or transactions list
+  rather than inferring a credit from the code.
+
+  Statuses themselves are unchanged — an expired conversion still reports `status: "failed"`, so the
+  six status values stay exactly as documented. The distinction travels on `failure_reason` alone,
+  which is why this needed no new field.
+
+  The full list, with the exact `failure_reason_message` for each, is in
+  [Failure reasons](/api-reference/failure-reasons).
+</Update>
+
+<Update label="2026-10-06">
+  ## South African account numbers are now validated before payout
+
+  A ZAR bank `account_number` that cannot structurally belong to its bank is now rejected with
+  `400 invalid_input`, instead of being accepted and failing at the bank days later. The check is
+  local to us — no extra latency, no new field, no schema change.
+
+  **This can reject requests that previously succeeded.** Two places:
+
+  * `POST /v1/beneficiaries` and `PATCH /v1/beneficiaries/{id}` — at the point the details are
+    captured, so the person entering them can still fix it.
+  * `POST /v1/quotes` for an offramp — which means **a beneficiary saved before today can fail
+    here**, even though it saved cleanly at the time. That is deliberate: the quote is the last
+    moment we hold the number before it goes to the payout network. Update the beneficiary's
+    `account_number` and quote again.
+
+  Two rules, and neither is a reformatting:
+
+  * **Digits only.** Separators are rejected, not stripped — `6200-4626-662` is invalid even
+    though removing the dashes would leave a valid number. We never alter what you send, so a
+    number we accept is exactly the number we pay. Trim your inputs before sending them.
+  * **Length must match the bank** on the beneficiary's `account_provider` — FNB 11, Capitec 10,
+    Nedbank 10, Standard Bank 9 or 11, Absa 8–11, and so on; any other South African bank is
+    checked against 8–11 digits. The full table is in
+    [Errors → South African account numbers](/errors#south-african-account-numbers).
+
+  The `message` names the bank and both digit counts — `FNB accounts are 11 digits; this account
+    number has 10.` — and is written to be shown to whoever entered the value. `"Invalid account"`
+  becomes a support ticket; the specific string gets fixed.
+
+  **PayShap is unaffected.** On the `payshap` rail `account_number` is an E.164 proxy, not a bank
+  account number, so none of these rules apply to it.
+
+  **What this does not do:** it cannot tell you whether an account exists, is open, or accepts
+  credits. A structurally perfect number can still be returned by the bank as unrecognised or
+  closed. This only removes the failures that were impossible from the start.
+</Update>
+
+<Update label="2026-10-02">
+  ## A returned offramp now refunds your wallet automatically
+
+  When a payout provider sends an offramp's funds back, the offramp goes `returned` as before — but
+  if we had already taken the source amount from your wallet, we now credit it straight back.
+  Previously the offramp went terminal while your balance stayed short, and recovering the funds
+  took a support request.
+
+  The refund is the **full source amount** of the offramp. No fee is withheld: the money movement
+  never happened, so nothing is retained.
+
+  How to see it:
+
+  * `offramp.returned` is still the signal. There is **no new webhook** — no `deposit.*` event is
+    emitted for the refund.
+  * The credit appears in [`GET /v1/transactions`](/api-reference/openapi#tag/transactions) as a
+    `deposit`-type transaction with a new `source_type` of **`offramp_reversal`**, linked to the
+    original offramp as its parent.
+  * Your wallet balance reflects it immediately.
+
+  If you reconcile on `source_type`, add `offramp_reversal` to the values you expect. A payout that
+  was never funded from your balance is unaffected — there is nothing to return, and no refund
+  transaction is written.
+</Update>
+
+<Update label="2026-09-30">
+  ## Pay South African beneficiaries over PayShap
+
+  Offramp beneficiaries in `ZAR` can now be paid over **PayShap**, South Africa's instant-payment
+  scheme. A beneficiary has a new optional field, `rail`, which says **how** money reaches the
+  account. `network` still says **what** the account is. A PayShap beneficiary is a bank account
+  (`network: "bank"`) that you pay with `rail: "payshap"`.
+
+  You address a PayShap beneficiary by its **proxy**, the recipient's mobile number in E.164 form.
+  Put the proxy in `account_number`:
+
+  ```json theme={null}
+  {
+    "type": "fiat",
+    "name": "J Doe",
+    "currency": "ZAR",
+    "country_code": "ZA",
+    "network": "bank",
+    "rail": "payshap",
+    "account_number": "+27821234567"
+  }
+  ```
+
+  **Do not send `provider_id`.** A proxy resolves to the bank that holds it, so you do not choose a
+  provider. If you send one, we ignore it. PayShap beneficiaries return `provider: null`.
+
+  **Do not send `account_name`.** We resolve the proxy to its registered holder before we create
+  the beneficiary, and we store that name. Any name you send is replaced. This is the reason to
+  prefer a proxy to a raw account number: we can verify who holds a proxy before you pay it.
+
+  If we cannot verify the proxy, we reject the request with
+  [`400 invalid_input`](/errors#invalid_input) and create no beneficiary. This happens when the
+  number is not registered for PayShap, and also when the recipient's bank does not answer in time.
+  You cannot tell the two cases apart, so retry once before you treat a number as invalid. If
+  PayShap itself is unavailable, you get
+  [`500 external_service_unavailable`](/errors#external_service_unavailable); retry later.
+
+  `rail: "payshap"` is valid only with `network: "bank"`, currency `ZAR` and country `ZA`. Any
+  other combination returns [`400 invalid_input`](/errors#invalid_input). If PayShap is switched
+  off, creating a PayShap beneficiary returns [`403 forbidden`](/errors#forbidden).
+
+  ### What changes in responses
+
+  * **Beneficiaries** echo `details.rail` when it is set. Beneficiaries without a rail do not get
+    the field.
+  * **Offramps** paid over PayShap report `payment_instrument.type` as `"bank_account"`, the same
+    value as any bank payout, with `payment_instrument.rail: "payshap"` beside it. If you branch
+    on `type`, you do not need to change anything.
+  * **`provider` can be `null`** on a fiat beneficiary's `details` and on `payment_instrument`,
+    but only when `rail` is `"payshap"`. If you read `provider.id` or `provider.name`, handle
+    `null` before you create PayShap beneficiaries.
+</Update>
+
+<Update label="2026-09-30">
+  ## Every webhook event is now documented, with payloads
+
+  [Webhook events](/webhooks/events) is a new reference covering all 27 events we emit: which
+  category each belongs to, exactly when it fires, and a complete example payload per family —
+  onramp, offramp, conversion, transfer, deposit and verification.
+
+  Nothing about the events themselves changed. If you have been reverse-engineering payloads from
+  deliveries, the page confirms the shape and the guarantees: `event_object` mirrors the matching
+  REST resource, plus event-only fields (`actual_source_amount`, `actual_destination_amount`,
+  `actual_rate`, `terminal_at`, `deposit_timestamp`) that the REST body does not carry. Reconcile
+  money against the `actual_*` values, not the quoted ones.
+
+  A few behaviours the page pins down that were easy to get wrong:
+
+  * A **held deposit sends two events** — `deposit.held`, then `deposit.confirmed` on release.
+  * A **cross-currency deposit never reaches a terminal `deposit.*` event**. It stays at
+    `received`; the `conversion.*` events carry the outcome.
+  * `funds_received` and `processing` are **separate** events on the FX families, and a resource
+    emits any given event **at most once** — so a cancelled-then-reversed transfer reaches you as a
+    single `transfer.failed`.
+
+  ### Removed: `kyc.expired`
+
+  The `kyc` category previously registered a `kyc.expired` topic that nothing ever emitted — no
+  endpoint has ever received one. It has been removed, so the subscribable list now matches what we
+  actually send. Verification events are `kyc.approved` and `kyc.rejected`; an expired verification
+  link is visible on `GET /v1/customers/{customerId}/verifications`, and the customer can request a
+  new one. No action needed unless you wrote a handler branch for an event you never received.
+</Update>
+
+<Update label="2026-09-24">
+  ## Cross-currency deposits now tell you when the money arrives
+
+  Deposits on a [cross-currency credential](/api-reference/auto-conversion) used to be silent
+  until the conversion started — your first webhook was `conversion.created`, and if the
+  conversion never started, you heard nothing at all.
+
+  They now emit `deposit.received` on arrival. The event waits for the FX quote, so it carries
+  what the deposit is worth in your wallet's currency rather than just the amount the payer sent:
+
+  ```json theme={null}
+  {
+    "event_type": "deposit.received",
+    "event_object": {
+      "source_amount": "10000.00",
+      "source_currency": "NGN",
+      "destination_amount": "6.046600",
+      "destination_currency": "USDC",
+      "metadata": { "auto_conversion": "true", "quote_id": "qt_…", "rate": "0.000605" },
+      "wallet": { "id": "wal_…", "currency": "USDC", "label": "Treasury USDC" },
+      "customer": { "id": "cust_…", "type": "business", "name": "Acme Ltd" },
+      "credential": { "id": "wcr_…", "currency": "NGN", "details": { "accountNumber": "…" } }
+    }
+  }
+  ```
+
+  The `wallet`, `customer` and `credential` blocks are new, and appear **only** on cross-currency
+  deposit events. They tell you which credential was funded — including the payer-facing bank
+  details of the virtual account — without a second API call. Same-currency deposit payloads are
+  unchanged.
+
+  Two things to know before you switch on handling:
+
+  * `destination_amount` is the **quoted** amount, not the settled one. Reconcile against
+    `actual_destination_amount` on `conversion.success`.
+  * A cross-currency deposit **never reaches a terminal** `deposit.*` state. It stays at
+    `received`, and the `conversion.*` topics carry the outcome. Do not wait for
+    `deposit.confirmed` on this path.
+
+  A deposit that breaches your customer's rolling money-in limit now emits `deposit.held` with
+  `metadata.hold_reason` of `tier_limit` and a null `destination_amount` — no rate is quoted while
+  it is under review. On release you receive `deposit.received` with the amount quoted at the
+  then-current rate.
+
+  ### Fixed: credential `currency` on a cross-currency credential
+
+  `GET /v1/wallets/{id}/credentials` and `GET /v1/wallets/{id}/credentials/{credentialId}`
+  reported the **wallet's** currency for every credential. On a cross-currency credential that was
+  wrong — an NGN credential on a USDC wallet returned `"currency": "USDC"` alongside its NGN bank
+  details. Both endpoints now return the credential's own currency. The nested `wallet.currency`
+  still reports the wallet's, so you can read both. Same-currency credentials are unaffected,
+  since the two values are identical there.
+
+  <Warning>
+    If you read `currency` on a cross-currency credential and relied on it meaning "the wallet's
+    currency", update that code — it now means "the currency this credential accepts".
+  </Warning>
+</Update>
+
+<Update label="2026-09-21">
+  ## Forwarding wallets send every deposit straight to your own address
+
+  `POST /v1/wallets` now accepts a `type`. The default, `custodial`, is every wallet you have
+  today: it holds a balance you can convert, offramp and transfer out of. Nothing about your
+  existing wallets changes, and omitting `type` keeps current behaviour.
+
+  The new `forwarding` type holds no balance. You give it an address you control at creation, and
+  every inflow is delivered there:
+
+  ```json theme={null}
+  POST /v1/wallets
+  {
+    "currency": "USDC",
+    "type": "forwarding",
+    "destination_address": "0x1111111111111111111111111111111111111111",
+    "destination_chain": "base"
+  }
+  ```
+
+  `destination_address` and `destination_chain` are required for `forwarding` and rejected on a
+  `custodial` wallet. `destination_chain` is one of `solana`, `base` or `ethereum` and must be
+  supported by the wallet's currency; the address is validated against the chain you pick. A
+  forwarding wallet must use a crypto currency.
+
+  **Both fields are permanent.** They cannot be changed after creation — create a new wallet to
+  change where funds land. Please double-check the address: every future deposit to that wallet
+  goes to it, and we cannot recover funds sent to an address you do not control.
+
+  Two consequences worth knowing before you integrate:
+
+  * A forwarding wallet's `available_balance`, `pending_balance` and `total_balance` always read
+    zero, because it never holds funds.
+  * It cannot be the **source** of a transfer, offramp or conversion — those are rejected with
+    [`400 invalid_input`](/errors#invalid_input). It is a destination only.
+
+  All four wallet endpoints now return `type`, `destination_address` and `destination_chain`. On a
+  custodial wallet the two destination fields are `null`.
+</Update>
+
+<Update label="2026-09-18">
+  ## Wallets now tell you which customer owns them
+
+  Wallet responses now include a `customer` object alongside the existing `customer_id`, so you no
+  longer need a second call to `/v1/customers` just to show an owner's name. It is returned by
+  `POST /v1/wallets`, `GET /v1/wallets`, `GET /v1/wallets/{walletId}` and
+  `PATCH /v1/wallets/{walletId}`.
+
+  The object carries `id`, `type`, `name`, `email`, `tier`, `created_at` and `updated_at` — the same
+  shape already nested on transfer, onramp, offramp, and conversion responses. For KYC status,
+  metadata, or the customer profile, keep using `GET /v1/customers/{customerId}`.
+
+  `customer_id` is unchanged and still present, so nothing you already key off has moved. Wallets
+  owned by your integration's default customer return a populated `customer` too — those are the
+  wallets you could not previously resolve a name for, since the default customer is not listed by
+  `GET /v1/customers`.
+</Update>
+
+<Update label="2026-08-25">
+  ## Quote by the amount the recipient receives with `target_amount`
+
+  Onramp, offramp, and conversion quotes now accept `target_amount` as an alternative to
+  `source_amount`. `target_amount` is the amount the recipient receives — the crypto credited to
+  the wallet on an onramp, the fiat paid to the beneficiary on an offramp, or the amount credited
+  to the destination wallet on a conversion.
+
+  Provide **exactly one** of `source_amount` or `target_amount`. Sending both, or neither, is
+  rejected with [`400 invalid_input`](/errors#invalid_input) before anything is created. When you
+  send `target_amount`, we compute the required `source_amount` and return it on the quote, so the
+  response always carries both `source_amount` and `destination_amount`.
+
+  The USDC 2-decimal-place settlement limit applies only when you supply `source_amount`. A
+  `target_amount`-driven quote is not constrained this way — we derive a settleable source amount
+  for you.
+
+  ## Quotes now return their fee breakdown
+
+  Quote responses now include an optional `fee` object with a per-component `line_items` breakdown
+  (`name`, `amount`, `currency`), matching the `fee` already returned on transactions. Each
+  component keeps its own currency — for example a gateway fee in the source currency and a network
+  fee in the destination currency. The `fee` field is omitted when a quote carries no fee
+  components.
+</Update>
+
+<Update label="2026-07-27">
+  ## USDC amounts are limited to 2 decimal places
+
+  USDC settles in whole US cents, so USDC amounts now accept at most **2 significant decimal
+  places**. Trailing zeros are fine — `2.980000` is accepted, `2.980228` is rejected with
+  [`400 invalid_amount_precision`](/errors#invalid_amount_precision).
+
+  This applies to `source_amount` on offramp quotes and conversion quotes, and to `amount` on
+  transfers. The request is rejected before anything is created, so a rejected call leaves no
+  quote and moves no funds.
+
+  If you derive amounts from a balance or a destination-anchored price, round to 2 decimal places
+  before sending them.
+
+  ## Offramps fail immediately when funding fails
+
+  An offramp whose funding transfer cannot be completed now fails as soon as that becomes known,
+  with the new failure reason [`funding_failed`](/api-reference/failure-reasons). Previously the
+  offramp stayed in `processing` until its provider quote expired, roughly an hour later.
+
+  No funds move in this case. Branch on `failure_reason` to retry with a new quote — and expect
+  the `offramp.failed` webhook sooner than before.
+</Update>
+
+
+# Error reference
+Source: https://docs.globalstack.io/errors
+
+Every error code the GlobalStack API can return, with HTTP status, common causes, and how to resolve it.
+
+Every API response — success or failure — uses the same envelope. On failure, `status` is `false`, `data` is `null`, `code` is a stable machine-readable error code, and `meta.next_steps` carries an `action` and a `docs_url` that links straight to this page at the matching anchor.
+
+```json theme={null}
+{
+  "status": false,
+  "message": "Human-readable explanation for developers and logs.",
+  "code": "bad_request",
+  "data": null,
+  "meta": {
+    "request_id": "req_01ABC...",
+    "timestamp": "2026-04-22T02:00:00Z",
+    "version": "1",
+    "next_steps": {
+      "action": "Review the request and retry with corrected parameters.",
+      "docs_url": "https://docs.globalstack.io/errors#bad_request"
+    }
+  }
+}
+```
+
+<Note>
+  `message` is for developers and logs — do not show it to end users. Quote `meta.request_id` when contacting support.
+</Note>
+
+These are **request-level** errors — the API call itself was rejected. If a call *succeeds* but the resulting money movement or verification later ends in a failed state, the reason is reported on the resource's `failure_reason` field instead — see [Failure reasons](/api-reference/failure-reasons).
+
+## Bad request
+
+**HTTP 400** · `bad_request`
+
+The request failed validation — a required field is missing, or a value has the wrong type or format.
+
+**Common causes**
+
+* A required field was omitted from the request body.
+* A field has the wrong type (e.g. a string where a number is expected).
+* A value fails a format or enum constraint. The `meta.errors` array lists the offending fields.
+
+**What to do** — Review the request and retry with corrected parameters.
+
+## Invalid input
+
+**HTTP 400** · `invalid_input`
+
+A field passed schema validation but failed a semantic check the API applies before processing.
+
+**Common causes**
+
+* A value is individually valid but invalid in context (e.g. an amount below the minimum, or mismatched currency pair).
+* A referenced field combination isn't permitted.
+* A South African `account_number` that cannot belong to the chosen bank — wrong number of digits, or any character that isn't a digit. See [South African account numbers](#south-african-account-numbers) below.
+
+**What to do** — Inspect the request payload for missing or malformed fields and retry. The `message` is specific and safe to show to the person who entered the value.
+
+### South African account numbers
+
+ZAR bank account numbers are checked structurally before a beneficiary is saved and again when an offramp quote is created. The check is local — it answers *"could this number belong to this bank?"* and nothing more. It cannot tell you whether the account exists, is open, or accepts credits.
+
+**Digits only.** Spaces, dashes and every other separator are rejected rather than stripped. `6200-4626-662` and `" 62004626662 "` are both invalid, even though removing the punctuation would leave a valid number — we never alter what you send, so a number we accept is exactly the number we pay.
+
+**Length depends on the bank**, taken from the `account_provider` on the beneficiary:
+
+| Bank          | Digits         |
+| ------------- | -------------- |
+| FNB / RMB     | 11             |
+| Capitec       | 10             |
+| Nedbank       | 10             |
+| Standard Bank | 9 or 11        |
+| Investec      | 11             |
+| TymeBank      | 11             |
+| Discovery     | 11             |
+| Bank Zero     | 11             |
+| African Bank  | 11             |
+| Absa          | 8, 9, 10 or 11 |
+
+Any other South African bank is checked against the general range of **8 to 11 digits**.
+
+The `message` names the bank and both counts — `FNB accounts are 11 digits; this account number has 10.` — so it can be surfaced directly to whoever is entering the details.
+
+Two cases worth knowing about:
+
+* **PayShap beneficiaries are not affected.** On the `payshap` rail, `account_number` is a proxy — a mobile number in E.164 form, or a ShapName such as `acme@nedbank` — so none of the rules above apply to it.
+* **An existing beneficiary can fail at quote time.** Beneficiaries saved before this check existed are validated the first time you quote against them, so `POST /v1/quotes` can return this error for a beneficiary that saved cleanly months ago. Update the beneficiary's `account_number` and quote again.
+
+## Invalid amount precision
+
+**HTTP 400** · `invalid_amount_precision`
+
+The amount carries more decimal places than the currency can settle. USDC settles in whole US cents, so USDC amounts support at most **2 significant decimal places**. Trailing zeros are fine — `2.980000` is accepted, `2.980228` is rejected.
+
+**Common causes**
+
+* A high-precision USDC `source_amount` or `amount` on an offramp quote, conversion quote, or transfer — for example a 6-decimal value taken directly from a balance or a destination-anchored price calculation.
+
+**What to do** — The amount has more decimal places than the currency can settle. Reduce it to the stated maximum (e.g. 2 decimal places for USDC — trailing zeros are fine) and retry.
+
+## Prohibited country
+
+**HTTP 400** · `prohibited_country`
+
+The `country_code` supplied is on GlobalStack's compliance prohibited list, so the merchant or customer cannot be onboarded from it. Onboarding is open to all other countries; this is a presence restriction only — it does not limit which currencies or corridors an onboarded merchant can transact in.
+
+**Common causes**
+
+* Registering a merchant or creating a customer with a `country_code` on the prohibited list.
+* A typo producing a prohibited ISO code. (A value that isn't a valid ISO-3166-1 alpha-2 code at all returns `invalid_input` instead.)
+
+**What to do** — This country is not available for onboarding.
+
+## Account resolution failed
+
+**HTTP 400** · `account_resolution_failed`
+
+The bank account could not be verified with the provider.
+
+**Common causes**
+
+* The `account_number` is wrong or doesn't exist at the named institution.
+* The `provider_id` (bank/institution) doesn't match the account.
+
+**What to do** — The account could not be verified with the provider. Confirm the account\_number and provider\_id and retry.
+
+## Authentication failed
+
+**HTTP 401** · `authentication_failed`
+
+The request was not authenticated.
+
+**Common causes**
+
+* Missing `Authorization` header.
+* An invalid, revoked, or malformed API key / bearer token.
+* Using a key from the wrong environment.
+
+**What to do** — Include a valid Bearer token in the Authorization header.
+
+## Merchant inactive
+
+**HTTP 401** · `merchant_inactive`
+
+The merchant account is authenticated but not yet active.
+
+**Common causes**
+
+* KYC/KYB verification is not complete.
+* The account is pending review.
+
+**What to do** — This merchant account is not active yet. Please follow the KYC link provided to complete identity verification (KYC/KYB) to activate it.
+
+## Forbidden
+
+**HTTP 403** · `forbidden`
+
+The credentials are valid but don't grant access to this resource.
+
+**Common causes**
+
+* The API key or user lacks permission for the resource.
+* Accessing a resource that belongs to another merchant.
+
+**What to do** — The credentials supplied do not have access to this resource.
+
+## Forbidden key role
+
+**HTTP 403** · `forbidden_key_role`
+
+The requested API-key role isn't permitted for this caller.
+
+**Common causes**
+
+* Creating or granting a key with a role above the caller's own grant.
+
+**What to do** — The requested API-key role is not permitted under this user or integration. Use a role at or below the caller's own grant.
+
+## Resource access required
+
+**HTTP 403** · `resource_access_required`
+
+The resource requires an explicit access grant the caller doesn't have yet.
+
+**Common causes**
+
+* Using a resource (e.g. a currency) that is gated behind an access request.
+
+**What to do** — This resource requires explicit access. Request it via POST /v1/currencies/:code/access-requests and retry after approval.
+
+## Not found
+
+**HTTP 404** · `not_found`
+
+The referenced resource doesn't exist.
+
+**Common causes**
+
+* A wrong, mistyped, or already-deleted resource id in the path.
+* The resource belongs to a different merchant account.
+
+**What to do** — Verify the resource identifier and retry.
+
+## Invalid status
+
+**HTTP 409** · `invalid_status`
+
+The action isn't allowed while the resource is in its current state.
+
+**Common causes**
+
+* Acting on a resource whose lifecycle has moved past the point the action is valid (e.g. cancelling an already-settled transfer).
+
+**What to do** — Check the resource status and ensure the action is permitted in its current state.
+
+## Conflict
+
+**HTTP 409** · `conflict`
+
+The request conflicts with the current state of the resource.
+
+**Common causes**
+
+* A concurrent update changed the resource since you last read it.
+
+**What to do** — The request conflicts with the current state of the resource. Refresh and retry.
+
+## Duplicate resource
+
+**HTTP 409** · `duplicate_resource`
+
+A resource with the same unique value already exists.
+
+**Common causes**
+
+* Re-using a value that must be unique (e.g. a `reference` or a beneficiary already on file).
+
+**What to do** — A resource with the same unique identifier already exists. Retry with different values.
+
+## Idempotency conflict
+
+**HTTP 409** · `idempotency_conflict`
+
+The `Idempotency-Key` was already used with a different request body.
+
+**Common causes**
+
+* Reusing an idempotency key for a request whose body differs from the original.
+
+**What to do** — The Idempotency-Key has already been used with a different request body. Use a new key, or replay the request with the original body.
+
+## Idempotency in progress
+
+**HTTP 409** · `idempotency_in_progress`
+
+A request with the same `Idempotency-Key` is still being processed.
+
+**Common causes**
+
+* A retry fired while the original request with that key is still in flight.
+
+**What to do** — A request with the same Idempotency-Key is still in progress. Retry after a short delay.
+
+## API key limit exceeded
+
+**HTTP 409** · `api_key_limit_exceeded`
+
+The account has reached its maximum number of active API keys.
+
+**Common causes**
+
+* Creating a new key while at the active-key cap.
+
+**What to do** — Revoke an unused API key before creating a new one.
+
+## Access already granted
+
+**HTTP 409** · `access_already_granted`
+
+The merchant already has an active grant for the resource.
+
+**Common causes**
+
+* Submitting an access request for a resource that's already granted.
+
+**What to do** — This merchant already has an active grant for the resource. No further action is required.
+
+## Ledger insufficient funds
+
+**HTTP 422** · `ledger_insufficient_funds`
+
+The source balance doesn't have enough available funds.
+
+**Common causes**
+
+* The wallet's available balance is below the requested amount (funds may be held/pending).
+
+**What to do** — The source balance does not have enough available funds for this amount. Fund the wallet or lower the amount and retry.
+
+## Rate limited
+
+**HTTP 429** · `rate_limited`
+
+You've exceeded the request rate limit.
+
+**Common causes**
+
+* Too many requests in a short window.
+
+**What to do** — You have exceeded the request rate limit. Slow down and retry shortly.
+
+## Internal error
+
+**HTTP 500** · `internal_error`
+
+An unexpected server error occurred.
+
+**Common causes**
+
+* An unhandled condition on the server.
+
+**What to do** — Retry the request after a short delay. If the failure persists, contact support.
+
+## Upstream service unavailable
+
+**HTTP 500** · `external_service_unavailable`
+
+An upstream service required to complete the request was unavailable or rejected the request. The failure detail is recorded on our side and never returned in the response.
+
+**Common causes**
+
+* A transient upstream outage, timeout, or rejection while fulfilling the request (for example, while creating a deposit credential).
+
+**What to do** — The request was not completed. Retry after a short delay; if the failure persists, contact support.
+
+## Configuration error
+
+**HTTP 500** · `configuration_error`
+
+The service is misconfigured for the requested operation. This is a deploy-time issue on our side, not something the caller can fix.
+
+**Common causes**
+
+* A required server-side configuration value is missing or invalid in the current environment.
+
+**What to do** — Nothing on your end resolves this. Contact support with the `request_id` if it persists.
+
+
+# 
+Source: https://docs.globalstack.io/index
+
+One API to accept, hold, convert, and pay out funds across 12 currencies in 18 African markets — powered by stablecoin infrastructure.
+
+<div>
+  <p>Cross-border · stablecoin rails</p>
+  <h1>Build with GlobalStack</h1>
+  <p>One API to accept, hold, convert, and pay out funds across 12 currencies in 18 African markets. Send, receive, or hold — GlobalStack handles the conversion, routing, and settlement.</p>
+
+  <div>
+    <a href="/quickstart">Get Started →</a>
+    <a href="/api-reference/supported-countries/list-countries">API Reference</a>
+  </div>
+</div>
+
+```bash Your first quote theme={null}
+curl https://api.globalstack.io/v1/onramps/quotes \
+  -H "Authorization: Bearer gsa_sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "amount": "100", "source_currency": "USDC", "target_currency": "NGN" }'
+```
+
+## Core flows
+
+<CardGroup>
+  <Card title="Quotes" icon="tag" href="/api-reference/quotes/create-an-onramp-quote">
+    Lock an FX rate before you move money.
+  </Card>
+
+  <Card title="Onramps" icon="arrow-down-to-line" href="/api-reference/onramps/execute-an-onramp">
+    Turn stablecoins into local currency, settled to a beneficiary.
+  </Card>
+
+  <Card title="Offramps" icon="arrow-up-from-line" href="/api-reference/offramps/execute-an-offramp">
+    Accept local currency and settle out in stablecoins.
+  </Card>
+
+  <Card title="Wallets" icon="wallet" href="/api-reference/wallets/create-a-wallet">
+    Hold stablecoins in a programmable, multi-currency wallet.
+  </Card>
+
+  <Card title="Conversions" icon="right-left" href="/api-reference/conversions/execute-a-conversion">
+    Convert between supported currencies on demand.
+  </Card>
+
+  <Card title="Webhooks" icon="bell" href="/api-reference/notification-webhooks/create-a-webhook-endpoint">
+    Subscribe to real-time events as money moves.
+  </Card>
+</CardGroup>
+
+## Why GlobalStack
+
+<CardGroup>
+  <Card title="API-first" icon="terminal">
+    One integration covers every direction money moves — no per-country endpoints, no separate SDKs.
+  </Card>
+
+  <Card title="Stablecoin rails" icon="coins">
+    Settlement in seconds, not days — no FX desks, no correspondent delays.
+  </Card>
+
+  <Card title="18 markets, 12 currencies" icon="globe">
+    Broad African coverage behind a single, consistent API surface.
+  </Card>
+</CardGroup>
+
+
+# Quickstart
+Source: https://docs.globalstack.io/quickstart
+
+From an API key to your first wallet in a few minutes.
+
+This guide takes you from zero to a funded-ready USDC wallet: authenticate, create a customer, and create a wallet for them. Every call uses the base URL `https://api.globalstack.io`.
+
+## Prerequisites
+
+* A **GlobalStack account** — request access from the [dashboard](https://dashboard.globalstack.io).
+* Your **secret API key**, issued during onboarding. Keep it server-side. See [Authentication](/api-reference/authentication).
+
+## Steps
+
+<Steps>
+  <Step title="Verify your key">
+    Make an authenticated call to a read-only endpoint to confirm your key works. Listing supported currencies needs no request body:
+
+    ```bash theme={null}
+    curl https://api.globalstack.io/v1/currencies \
+      -H "Authorization: Bearer YOUR_SECRET_KEY"
+    ```
+
+    A `200` with a `"status": true` envelope means you're authenticated. A `401` with `authentication_failed` means the key is missing or wrong.
+  </Step>
+
+  <Step title="Create a customer">
+    Wallets belong to a customer. Create one with their type, name, email, and ISO 3166-1 alpha-2 `country_code`:
+
+    ```bash theme={null}
+    curl https://api.globalstack.io/v1/customers \
+      -X POST \
+      -H "Authorization: Bearer YOUR_SECRET_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "type": "individual",
+        "name": "Ada Lovelace",
+        "email": "ada@example.com",
+        "country_code": "NG"
+      }'
+    ```
+
+    The response returns the new customer's id (prefixed `cus_`). Save it for the next step.
+  </Step>
+
+  <Step title="Create a wallet">
+    Create a USDC wallet for that customer. Only `currency` is required:
+
+    ```bash theme={null}
+    curl https://api.globalstack.io/v1/wallets \
+      -X POST \
+      -H "Authorization: Bearer YOUR_SECRET_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "currency": "USDC",
+        "customer_id": "cus_...",
+        "label": "Ada — USDC"
+      }'
+    ```
+
+    You now have a wallet (id prefixed `wal_`) ready to hold and move funds.
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup>
+  <Card title="Get a quote" icon="tag" href="/api-reference/quotes/create-an-onramp-quote">
+    Lock an FX rate before you move money.
+  </Card>
+
+  <Card title="Run an onramp" icon="arrow-down-to-line" href="/api-reference/onramps/execute-an-onramp">
+    Turn stablecoins into local currency, settled to a beneficiary.
+  </Card>
+
+  <Card title="Stay idempotent" icon="rotate" href="/api-reference/idempotency">
+    Safely retry write requests without creating duplicates.
+  </Card>
+
+  <Card title="Handle errors" icon="triangle-exclamation" href="/errors">
+    The response envelope and the error codes to branch on.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Pass an `Idempotency-Key` header on every `POST` so a retry never creates a second customer or wallet.
+</Tip>
+
+
+# Webhook events
+Source: https://docs.globalstack.io/webhooks/events
+
+Every event GlobalStack emits, when it fires, and the exact payload you receive.
+
+Webhooks tell you when something happens on your integration — a deposit arrives, a conversion
+settles, a verification is approved — without polling for it.
+
+Every delivery uses the same envelope. The interesting part is `event_object`: it carries the **same
+body as the matching REST resource**, plus a few fields that only make sense on an event. So if you
+already handle `GET /v1/conversions/{id}`, you already know how to read a `conversion.success`
+payload.
+
+## Subscribe by category
+
+You don't subscribe to individual events. You subscribe to **categories** — families of related
+events — when you [create a webhook endpoint](/api-reference/openapi#tag/notification-webhooks/POST/v1/notifications/webhooks),
+and receive every event in the family.
+
+| Category     | Events you receive                                                                                                                           |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `onramp`     | `onramp.awaiting_deposit`, `onramp.funds_received`, `onramp.processing`, `onramp.success`, `onramp.failed`, `onramp.returned`                |
+| `offramp`    | `offramp.created`, `offramp.funds_received`, `offramp.processing`, `offramp.success`, `offramp.failed`, `offramp.returned`                   |
+| `conversion` | `conversion.created`, `conversion.funds_received`, `conversion.processing`, `conversion.success`, `conversion.failed`, `conversion.returned` |
+| `transfer`   | `transfer.processing`, `transfer.success`, `transfer.failed`                                                                                 |
+| `deposit`    | `deposit.received`, `deposit.held`, `deposit.confirmed`, `deposit.failed`                                                                    |
+| `kyc`        | `kyc.approved`, `kyc.rejected`                                                                                                               |
+
+<Note>
+  New endpoints are created **inactive**. Store the `signing_secret` from the create response — it is
+  shown once — then activate the endpoint with `PATCH /v1/notifications/webhooks/{id}`
+  `{ "active": true }`. Nothing is delivered until it is active.
+</Note>
+
+## The envelope
+
+Every event, in every category, arrives in this shape:
+
+```json theme={null}
+{
+  "event_id": "evt_1b8dbe64-1f4e-5a2c-9c31-6d9a51a0f0c2",
+  "event_type": "conversion.success",
+  "event_category": "conversion",
+  "event_developer_id": "int_01HXYZABC1234567890ABCDEFG",
+  "api_version": "v1",
+  "event_created_at": "2026-09-30T09:12:44.000Z",
+  "event_object_id": "con_01KPBH8MD6R7YDJ82T4D6M3V1T",
+  "event_object_status": "success",
+  "event_object_changes": { "status": ["processing", "success"] },
+  "event_object": { }
+}
+```
+
+| Field                  | What it is                                                                                                                                                                             |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `event_id`             | Unique id for this event, `evt_` prefixed. Stable across retries — use it to deduplicate.                                                                                              |
+| `event_type`           | The event, e.g. `conversion.success`. Branch on this.                                                                                                                                  |
+| `event_category`       | The family the event belongs to.                                                                                                                                                       |
+| `event_developer_id`   | Your integration's public id. Useful if one receiver serves several integrations.                                                                                                      |
+| `api_version`          | Envelope version. `v1` today; a breaking change to the shape bumps it.                                                                                                                 |
+| `event_created_at`     | When the event **happened** — not when it was delivered. A retry keeps the original time.                                                                                              |
+| `event_object_id`      | The id of the resource the event is about (`con_…`, `txn_…`, `tfr_…`).                                                                                                                 |
+| `event_object_status`  | The resource's status at the moment of the event.                                                                                                                                      |
+| `event_object_changes` | `{ "status": [previous, new] }` on a real status change; `null` when nothing changed (a replay, or an event that doesn't move the status). `previous` is `null` on a first transition. |
+| `event_object`         | The resource itself. Shapes below.                                                                                                                                                     |
+
+Signature headers and how to verify them are covered in
+[Verify webhook signatures](/webhooks/verify-signatures).
+
+## When each event fires
+
+### Onramps, offramps and conversions
+
+These three run the same lifecycle, so they emit the same six events.
+
+| Event                                    | Fires when                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `onramp.awaiting_deposit`                | The onramp is created and waiting for the payer's deposit. Show them `deposit_instruction`.                                                                                                                                                                                                                      |
+| `offramp.created` / `conversion.created` | The resource is created and accepted.                                                                                                                                                                                                                                                                            |
+| `*.funds_received`                       | Your funds arrived and were recognised. Work has not finished.                                                                                                                                                                                                                                                   |
+| `*.processing`                           | The conversion or payout is in flight.                                                                                                                                                                                                                                                                           |
+| `*.success`                              | Done. The destination has been credited. **Terminal.**                                                                                                                                                                                                                                                           |
+| `*.failed`                               | Could not complete. Read [`failure_reason`](/api-reference/failure-reasons) — it distinguishes a quote nobody funded (`quote_expired`) from a genuine failure. **Terminal.**                                                                                                                                     |
+| `*.returned`                             | Funds were sent back to their origin. Also carries [`failure_reason: returned`](/api-reference/failure-reasons) — the one reason set while `status` is not `"failed"`. **Terminal.** For an offramp that had already been debited, your wallet is credited back for the full source amount — see the note below. |
+
+<Tip>
+  `funds_received` and `processing` are separate events on purpose — `funds_received` is your cue
+  that the money is in, which is usually what you tell a customer about. Don't treat either as
+  final; wait for `success`, `failed` or `returned`.
+</Tip>
+
+<Note>
+  **A returned offramp refunds your wallet automatically.** If the payout had already been funded
+  from your balance when the provider sent the money back, we credit the full source amount back to
+  the same wallet. The refund shows up in [`GET /v1/transactions`](/api-reference/openapi#tag/transactions)
+  as a `deposit`-type transaction with `source_type` of `offramp_reversal`, linked to the original
+  offramp as its parent. No `deposit.*` event is emitted for it — `offramp.returned` is the signal,
+  and the offramp's `source_amount` is the amount returned.
+</Note>
+
+### Transfers
+
+| Event                 | Fires when                                                       |
+| --------------------- | ---------------------------------------------------------------- |
+| `transfer.processing` | The payout has been submitted.                                   |
+| `transfer.success`    | The payout completed. **Terminal.**                              |
+| `transfer.failed`     | The payout failed, was cancelled, or was reversed. **Terminal.** |
+
+A cancelled or reversed transfer arrives as `transfer.failed` — `failure_reason` tells you which
+(`cancelled`, `reversed`, or another code).
+
+### Deposits
+
+| Event               | Fires when                                                                                                                                                                                                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `deposit.received`  | Funds detected but not yet final — a crypto deposit seen on-chain before confirmation, or a cross-currency deposit that has just been priced. On the cross-currency path `destination_amount` is `null` when the balance is under the corridor minimum; `metadata.conversion_pending_reason` says why. |
+| `deposit.held`      | Credited but withheld pending review. `metadata.hold_reason` is `tier_limit`, `payin_frozen` or `payin_disabled`.                                                                                                                                                                                      |
+| `deposit.confirmed` | Settled and spendable from the wallet balance. **Terminal.**                                                                                                                                                                                                                                           |
+| `deposit.failed`    | The deposit could not be credited. **Terminal.**                                                                                                                                                                                                                                                       |
+
+Two paths are worth planning for:
+
+* **A held deposit sends two events.** `deposit.held` first, then `deposit.confirmed` when the hold
+  is released. Don't treat `held` as final, and don't expect it on every deposit.
+* **A [cross-currency deposit](/api-reference/auto-conversion) never reaches a terminal
+  `deposit.*` event.** It stays at `received`, and the `conversion.*` events carry the outcome.
+  Waiting for `deposit.confirmed` on that path waits forever.
+* **A cross-currency deposit may arrive with no converted amount and no `conversion.*` events at
+  all.** Below the corridor minimum it is recorded, you are notified, and its funds wait for the
+  next deposit to convert them together. Treat a `null` `destination_amount` as "not converted
+  yet", and don't sum it across deposits — see
+  [Minimum conversion amount](/api-reference/auto-conversion#minimum-conversion-amount).
+
+### Verifications
+
+| Event          | Fires when                                                                                                     |
+| -------------- | -------------------------------------------------------------------------------------------------------------- |
+| `kyc.approved` | The verification passed. `customer.tier` is the customer's **new** tier.                                       |
+| `kyc.rejected` | The verification was declined. Read [`failure_reason`](/api-reference/failure-reasons#verification-kyc-codes). |
+
+Only final outcomes are sent. Intermediate progress — a customer opening the link, submitting
+documents, or being asked to resubmit — is visible on
+`GET /v1/customers/{customerId}/verifications` and does not emit a webhook.
+
+## Payloads
+
+`event_object` is the REST resource body **plus** event-only fields. Two groups of extras:
+
+| Extra field                                                        | On                                    | Why it's there                                                                                                         |
+| ------------------------------------------------------------------ | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `actual_source_amount`, `actual_destination_amount`, `actual_rate` | onramp, offramp, conversion           | What actually settled, versus the quoted `rate` and amounts. Reconcile against these.                                  |
+| `terminal_at`                                                      | onramp, offramp, conversion, transfer | When the resource reached its terminal state. `null` before then.                                                      |
+| `transaction_hash`                                                 | onramp (in practice)                  | The on-chain hash of the payout that delivered your crypto. **Present or absent — never `null`.** See below.           |
+| `deposit_timestamp`                                                | deposit                               | When the deposit was observed (on-chain time or the payer's transfer time), which differs from the row's `created_at`. |
+| `wallet`, `customer`, `credential`                                 | cross-currency deposits only          | Which wallet the money lands in, whose it is, and which credential was funded — no second API call.                    |
+
+<Warning>
+  Reconcile money against `actual_*`, not against `rate`/`destination_amount`. The quoted values are
+  what you were promised; the `actual_*` values are what settled. They are `null` until the
+  economics are known.
+</Warning>
+
+### Onramp
+
+A completed NGN → USDC onramp. Same body as `GET /v1/onramps/{id}`, plus the four event fields.
+
+```json theme={null}
+{
+  "event_id": "evt_4d5e0a27-7a63-51a1-8c0b-2f8d43f7d901",
+  "event_type": "onramp.success",
+  "event_category": "onramp",
+  "event_developer_id": "int_01HXYZABC1234567890ABCDEFG",
+  "api_version": "v1",
+  "event_created_at": "2026-09-30T09:12:44.000Z",
+  "event_object_id": "onr_01KPBH802PXQQXT8ASJGE0QX2K",
+  "event_object_status": "success",
+  "event_object_changes": { "status": ["processing", "success"] },
+  "event_object": {
+    "id": "onr_01KPBH802PXQQXT8ASJGE0QX2K",
+    "reference": "INV-2026-001",
+    "status": "success",
+    "quote_id": "quo_01KPBK123456789ABCDEFG",
+    "rate_source": "quoted",
+    "customer": {
+      "id": "cust_01HXYZABC1234567890ABCDEFG",
+      "type": "individual",
+      "name": "Alice Johnson",
+      "email": "alice@example.com",
+      "tier": "tier_2",
+      "created_at": "2026-09-01T10:00:00.000Z",
+      "updated_at": "2026-09-01T10:00:00.000Z"
+    },
+    "wallet": { "id": "wal_01HXYZABC1234567890ABCDEFG", "currency": "USDC", "label": "Treasury USDC" },
+    "payment_instrument": null,
+    "source_amount": "10000.00",
+    "source_currency": "NGN",
+    "destination_amount": "6.046600",
+    "received_amount": "6.044100",
+    "destination_currency": "USDC",
+    "rate": "0.000605",
+    "rate_locked_until": "2026-09-30T09:42:00.000Z",
+    "deposit_instruction": {
+      "version": 1,
+      "type": "fiat",
+      "accountName": "GLOBALSTACK / FX ENGINE",
+      "accountNumber": "0123456789",
+      "bankName": "Access Bank",
+      "bankCode": "000014",
+      "expiresAt": "2026-09-30T09:42:00.000Z",
+      "depositReference": "GSVRYTZ496CM",
+      "message": "Include the deposit_reference in the transfer narration/reference so funds are correctly allocated to this deposit."
+    },
+    "failure_reason": null,
+    "failure_reason_message": null,
+    "metadata": { "order_id": "ord_demo_001" },
+    "created_at": "2026-09-30T09:10:03.000Z",
+    "updated_at": "2026-09-30T09:12:44.000Z",
+    "actual_source_amount": "10000.00",
+    "actual_destination_amount": "6.044100",
+    "actual_rate": "0.000604",
+    "terminal_at": "2026-09-30T09:12:44.000Z",
+    "transaction_hash": "0x9f2c4b7e1a3d5f6089bc2e4a7d1f3b5c8e0a2d4f6b8c1e3a5d7f9b0c2e4a6d80"
+  }
+}
+```
+
+<Note>
+  **`transaction_hash` is present or absent, never `null`.** It is the on-chain hash of the payout
+  that delivered your crypto, so it appears on `onramp.success` and effectively nowhere else: an
+  offramp pays a bank account and has no on-chain leg, and a conversion between two of your own
+  balances moves nothing on-chain. Some onramp rails also settle before a hash exists.
+
+  Treat it as a convenience, not a guarantee, and **store it when you receive it**: this webhook is
+  the only place it appears. `GET /v1/onramps/{id}` does not return it, and a hash that reaches us
+  after the terminal event does not trigger a second webhook — an onramp delivers `onramp.success`
+  exactly once. If you need a hash you did not capture, contact support.
+</Note>
+
+### Offramp
+
+A failed USDC → NGN offramp. Note `failure_reason`, the `null` `actual_*` values (nothing settled),
+and that `terminal_at` is set because `failed` is terminal.
+
+```json theme={null}
+{
+  "event_id": "evt_8c1a0f93-4b77-5de0-9a24-7c5f1b3ea882",
+  "event_type": "offramp.failed",
+  "event_category": "offramp",
+  "event_developer_id": "int_01HXYZABC1234567890ABCDEFG",
+  "api_version": "v1",
+  "event_created_at": "2026-09-30T11:04:19.000Z",
+  "event_object_id": "ofr_01KPBH887CCT3A53EW3F8R0VQG",
+  "event_object_status": "failed",
+  "event_object_changes": { "status": ["processing", "failed"] },
+  "event_object": {
+    "id": "ofr_01KPBH887CCT3A53EW3F8R0VQG",
+    "reference": "PAYOUT-4471",
+    "status": "failed",
+    "retry_on_failure": false,
+    "quote_id": "quo_01KPBK123456789ABCDEFG",
+    "rate_source": "quoted",
+    "customer": {
+      "id": "cust_01HXYZABC1234567890ABCDEFG",
+      "type": "individual",
+      "name": "Alice Johnson",
+      "email": "alice@example.com",
+      "tier": "tier_2",
+      "created_at": "2026-09-01T10:00:00.000Z",
+      "updated_at": "2026-09-01T10:00:00.000Z"
+    },
+    "wallet": { "id": "wal_01HXYZABC1234567890ABCDEFG", "currency": "USDC", "label": "Treasury USDC" },
+    "beneficiary": {
+      "id": "ben_01KPBAP7WTDKQKW5B3R31VPNX4",
+      "customer_id": "cust_01HXYZABC1234567890ABCDEFG",
+      "name": "Alice Bank Beneficiary",
+      "label": "Alice's salary account",
+      "type": "fiat",
+      "currency": "NGN",
+      "merchant_reference": "ref_01HXYZ4K5ABCDEFGHJKLMNPQRS",
+      "details": { "accountNumber": "0039415616", "bankCode": "000014" },
+      "metadata": {},
+      "status": "active",
+      "created_at": "2026-09-01T10:05:00.000Z",
+      "updated_at": "2026-09-01T10:05:00.000Z"
+    },
+    "narration": "Payment for Invoice INV-2026-001",
+    "payment_instrument": {
+      "id": "pay_01KPBH895W6PH3WY1D9KZH3M5D",
+      "beneficiary_id": "ben_01KPBAP7WTDKQKW5B3R31VPNX4",
+      "type": "bank_account",
+      "country_code": "NG",
+      "provider": { "id": "prov_01KPBAP7WTDKQKW5B3R31VPNX4", "name": "Access Bank", "code": "000014" },
+      "account_name": "ALICE JOHNSON",
+      "account_number": "0039415616"
+    },
+    "source_amount": "100.000000",
+    "source_currency": "USDC",
+    "destination_amount": "165000.00",
+    "received_amount": null,
+    "destination_currency": "NGN",
+    "rate": "1650.000000",
+    "rate_locked_until": "2026-09-30T11:34:00.000Z",
+    "failure_reason": "temporarily_unavailable",
+    "failure_reason_message": "This transaction could not be completed right now. Please try again later.",
+    "metadata": {},
+    "created_at": "2026-09-30T11:02:12.000Z",
+    "updated_at": "2026-09-30T11:04:19.000Z",
+    "actual_source_amount": null,
+    "actual_destination_amount": null,
+    "actual_rate": null,
+    "terminal_at": "2026-09-30T11:04:19.000Z"
+  }
+}
+```
+
+### Conversion
+
+A wallet-to-wallet conversion that has just been created. `actual_*` and `terminal_at` are `null`
+because nothing has settled yet.
+
+```json theme={null}
+{
+  "event_id": "evt_1b8dbe64-1f4e-5a2c-9c31-6d9a51a0f0c2",
+  "event_type": "conversion.created",
+  "event_category": "conversion",
+  "event_developer_id": "int_01HXYZABC1234567890ABCDEFG",
+  "api_version": "v1",
+  "event_created_at": "2026-09-30T14:20:01.000Z",
+  "event_object_id": "con_01KPBH8MD6R7YDJ82T4D6M3V1T",
+  "event_object_status": "created",
+  "event_object_changes": { "status": [null, "created"] },
+  "event_object": {
+    "id": "con_01KPBH8MD6R7YDJ82T4D6M3V1T",
+    "reference": "TREASURY-0031",
+    "status": "created",
+    "quote_id": "quo_01KPBK123456789ABCDEFG",
+    "rate_source": "quoted",
+    "customer": {
+      "id": "cust_01HXYZABC1234567890ABCDEFG",
+      "type": "business",
+      "name": "Acme Ltd",
+      "email": "ops@acme.example",
+      "tier": "tier_2",
+      "created_at": "2026-09-01T10:00:00.000Z",
+      "updated_at": "2026-09-01T10:00:00.000Z"
+    },
+    "source_wallet": { "id": "wal_01HXYZABC1234567890ABCDEFG", "currency": "USDC", "label": "Treasury USDC" },
+    "destination_wallet": { "id": "wal_01HABCXYZ9876543210ZYXWVU", "currency": "NGN", "label": "NGN Payouts" },
+    "source_amount": "500.000000",
+    "source_currency": "USDC",
+    "destination_amount": "825000.00",
+    "received_amount": null,
+    "destination_currency": "NGN",
+    "rate": "1650.000000",
+    "failure_reason": null,
+    "failure_reason_message": null,
+    "metadata": { "payout_batch": "batch_001" },
+    "created_at": "2026-09-30T14:20:01.000Z",
+    "updated_at": "2026-09-30T14:20:01.000Z",
+    "actual_source_amount": null,
+    "actual_destination_amount": null,
+    "actual_rate": null,
+    "terminal_at": null
+  }
+}
+```
+
+### Transfer
+
+A completed crypto payout. Transfers have no FX leg, so there are **no `actual_*` fields** — only
+`terminal_at`.
+
+```json theme={null}
+{
+  "event_id": "evt_6a2f7c15-9d34-5b88-a0e7-1f2b6c84d3aa",
+  "event_type": "transfer.success",
+  "event_category": "transfer",
+  "event_developer_id": "int_01HXYZABC1234567890ABCDEFG",
+  "api_version": "v1",
+  "event_created_at": "2026-09-30T16:41:07.000Z",
+  "event_object_id": "tfr_01KPBJ4M8QZC1T7Y3E6R9V2XKD",
+  "event_object_status": "success",
+  "event_object_changes": { "status": ["processing", "success"] },
+  "event_object": {
+    "id": "tfr_01KPBJ4M8QZC1T7Y3E6R9V2XKD",
+    "reference": "SUPPLIER-889",
+    "status": "success",
+    "retry_on_failure": true,
+    "customer": {
+      "id": "cust_01HXYZABC1234567890ABCDEFG",
+      "type": "business",
+      "name": "Acme Ltd",
+      "email": "ops@acme.example",
+      "tier": "tier_2",
+      "created_at": "2026-09-01T10:00:00.000Z",
+      "updated_at": "2026-09-01T10:00:00.000Z"
+    },
+    "wallet": { "id": "wal_01HXYZABC1234567890ABCDEFG", "currency": "USDC", "label": "Treasury USDC" },
+    "beneficiary": {
+      "id": "ben_01KPBAP7WTDKQKW5B3R31VPNX4",
+      "customer_id": "cust_01HXYZABC1234567890ABCDEFG",
+      "name": "Supplier Wallet",
+      "label": "Supplier USDC",
+      "type": "crypto",
+      "currency": "USDC",
+      "merchant_reference": "sup_889",
+      "details": { "address": "0x1111111111111111111111111111111111111111", "network": "base" },
+      "metadata": {},
+      "status": "active",
+      "created_at": "2026-09-02T08:00:00.000Z",
+      "updated_at": "2026-09-02T08:00:00.000Z"
+    },
+    "amount": "250.000000",
+    "currency": "USDC",
+    "network": "base",
+    "transaction_hash": "0x9f2c4b7e1a3d5f6089bc2e4a7d1f3b5c8e0a2d4f6b8c1e3a5d7f9b0c2e4a6d80",
+    "failure_reason": null,
+    "failure_reason_message": null,
+    "metadata": { "payout_batch": "batch_001" },
+    "created_at": "2026-09-30T16:39:55.000Z",
+    "updated_at": "2026-09-30T16:41:07.000Z",
+    "terminal_at": "2026-09-30T16:41:07.000Z"
+  }
+}
+```
+
+### Deposit
+
+A confirmed same-currency crypto deposit. `event_object` is the transaction record, so it carries
+`transaction_hash`, the wallet it credited, and the on-chain addresses in `metadata`.
+
+```json theme={null}
+{
+  "event_id": "evt_c0d9e5b2-7f18-5a46-b3c9-8e1d0a7f2b64",
+  "event_type": "deposit.confirmed",
+  "event_category": "deposit",
+  "event_developer_id": "int_01HXYZABC1234567890ABCDEFG",
+  "api_version": "v1",
+  "event_created_at": "2026-09-30T07:55:12.000Z",
+  "event_object_id": "txn_01KPBG1Q3Z8X1Q6VJRE5R8ZFBG",
+  "event_object_status": "confirmed",
+  "event_object_changes": null,
+  "event_object": {
+    "id": "txn_01KPBG1Q3Z8X1Q6VJRE5R8ZFBG",
+    "reference": "dep-01KPBFZ9M4T2V6X8Z0B2D4F6H8",
+    "source_type": "credential",
+    "source_id": "wcr_01HXYZABC1234567890ABCDEFG",
+    "transaction_hash": "0x9f2c4b7e1a3d5f6089bc2e4a7d1f3b5c8e0a2d4f6b8c1e3a5d7f9b0c2e4a6d80",
+    "customer_id": "cust_01HXYZABC1234567890ABCDEFG",
+    "from_wallet_id": null,
+    "to_wallet_id": "wal_01HXYZABC1234567890ABCDEFG",
+    "type": "deposit",
+    "status": "success",
+    "source_amount": "1000.000000",
+    "source_currency": "USDC",
+    "destination_amount": "1000.000000",
+    "destination_currency": "USDC",
+    "received_amount": "1000.000000",
+    "confirmed_at": "2026-09-30T07:55:12.000Z",
+    "metadata": {
+      "to_address": "0x2222222222222222222222222222222222222222",
+      "from_address": "0x3333333333333333333333333333333333333333"
+    },
+    "created_at": "2026-09-30T07:54:40.000Z",
+    "updated_at": "2026-09-30T07:55:12.000Z",
+    "parent_transaction_id": null,
+    "root_transaction_id": "txn_01KPBG1Q3Z8X1Q6VJRE5R8ZFBG",
+    "deposit_timestamp": "2026-09-30T07:55:09.000Z"
+  }
+}
+```
+
+<Note>
+  `event_object_status` reports the deposit event (`received` / `held` / `confirmed` / `failed`),
+  while `event_object.status` reports the underlying transaction status (`processing` / `received` /
+  `success` / `failed`). They describe the same thing at different resolutions — branch on
+  `event_type`.
+</Note>
+
+#### Cross-currency deposit
+
+A deposit into a [cross-currency credential](/api-reference/auto-conversion) adds three blocks —
+`wallet`, `customer` and `credential` — so you can see which credential was funded, including the
+payer-facing bank details, without another call. `destination_amount` is the **quoted** value in the
+wallet's currency.
+
+```json theme={null}
+{
+  "event_id": "evt_2e7b1d40-5c92-5f03-8a16-4b9c3e0d7f58",
+  "event_type": "deposit.received",
+  "event_category": "deposit",
+  "event_developer_id": "int_01HXYZABC1234567890ABCDEFG",
+  "api_version": "v1",
+  "event_created_at": "2026-09-30T08:30:00.000Z",
+  "event_object_id": "txn_01KPBG7YH2N4P8Q1R3S5T7V9WX",
+  "event_object_status": "received",
+  "event_object_changes": null,
+  "event_object": {
+    "id": "txn_01KPBG7YH2N4P8Q1R3S5T7V9WX",
+    "reference": "dep-01KPBG5XW1R3T5V7Y9A1C3E5G7_credential_credit",
+    "source_type": "credential",
+    "source_id": "wcr_01HXYZABC1234567890ABCDEFG",
+    "transaction_hash": null,
+    "customer_id": "cust_01HXYZABC1234567890ABCDEFG",
+    "from_wallet_id": null,
+    "to_wallet_id": "wal_01HXYZABC1234567890ABCDEFG",
+    "type": "deposit",
+    "status": "received",
+    "source_amount": "10000.00",
+    "source_currency": "NGN",
+    "destination_amount": "6.046600",
+    "destination_currency": "USDC",
+    "received_amount": "6.046600",
+    "confirmed_at": null,
+    "metadata": {
+      "auto_conversion": "true",
+      "quote_id": "quo_01KPBK123456789ABCDEFG",
+      "rate": "0.000605",
+      "sender_account_name": "JOHN DOE",
+      "sender_bank_name": "GTBank",
+      "sender_account_number": "2813"
+    },
+    "created_at": "2026-09-30T08:29:44.000Z",
+    "updated_at": "2026-09-30T08:30:00.000Z",
+    "parent_transaction_id": null,
+    "root_transaction_id": "txn_01KPBG7YH2N4P8Q1R3S5T7V9WX",
+    "deposit_timestamp": "2026-09-30T08:29:44.000Z",
+    "wallet": { "id": "wal_01HXYZABC1234567890ABCDEFG", "currency": "USDC", "label": "Treasury USDC" },
+    "customer": {
+      "id": "cust_01HXYZABC1234567890ABCDEFG",
+      "type": "business",
+      "name": "Acme Ltd",
+      "email": "ops@acme.example",
+      "tier": "tier_2",
+      "created_at": "2026-09-01T10:00:00.000Z",
+      "updated_at": "2026-09-01T10:00:00.000Z"
+    },
+    "credential": {
+      "id": "wcr_01HXYZABC1234567890ABCDEFG",
+      "type": "fiat",
+      "currency": "NGN",
+      "network": "bank",
+      "label": "NGN collections",
+      "metadata": { "team": "ops" },
+      "details": {
+        "accountName": "ACME LTD",
+        "accountNumber": "1234567890",
+        "bankName": "Wema Bank",
+        "bankCode": "035",
+        "currency": "NGN",
+        "reference": "GSVRYTZ496CM"
+      },
+      "status": "active",
+      "provider_resource_id": "cdw_01HXYZABC1234567890ABCDEFG",
+      "created_at": "2026-09-10T12:00:00.000Z",
+      "updated_at": "2026-09-10T12:00:00.000Z"
+    }
+  }
+}
+```
+
+A held cross-currency deposit arrives as `deposit.held` with `metadata.hold_reason` and a `null`
+`destination_amount` — no rate is quoted while it is under review. On release you receive
+`deposit.received` priced at the then-current rate.
+
+#### Who sent a fiat deposit
+
+When money lands in a fiat credential, `metadata` names the payer as far as the bank reported them.
+The same keys appear on `GET /v1/transactions/{id}`, so a webhook and a later read agree.
+
+| Key                     | What it is                                                           |
+| ----------------------- | -------------------------------------------------------------------- |
+| `sender_account_name`   | The name on the sending account.                                     |
+| `sender_bank_name`      | The sending bank.                                                    |
+| `sender_account_number` | The **last 4 digits** of the account number — never the full number. |
+
+Three rules to code against:
+
+* **A key you do not see was not reported.** Keys are omitted, never blank, so check for presence
+  rather than comparing against `""`. Banks report these inconsistently: you may get the name
+  without the bank, or nothing at all.
+* **`sender_account_number` is a last-4, always.** Use it to help a human recognise a payment, not
+  as an account identifier.
+* **On deposits into a Paystack NGN virtual account, the bank and account describe the virtual
+  account the money landed in**, while the name is the payer's. That rail does not expose the
+  payer's own bank details to us, and we would rather tell you that than guess.
+
+Crypto deposits carry no sender keys — the on-chain `from_address` in `metadata` is the equivalent.
+
+### Verification
+
+`kyc.approved` carries the verified `profile`. Identity-document numbers are **masked to their last
+four digits** — we never send the full number.
+
+```json theme={null}
+{
+  "event_id": "evt_7d3a9f61-2b48-5c07-9e15-3a8d6b2f4c90",
+  "event_type": "kyc.approved",
+  "event_category": "kyc",
+  "event_developer_id": "int_01HXYZABC1234567890ABCDEFG",
+  "api_version": "v1",
+  "event_created_at": "2026-09-30T13:07:22.000Z",
+  "event_object_id": "kyc_01KPBJZ8T4W6Y0A2C4E6G8J1LN",
+  "event_object_status": "approved",
+  "event_object_changes": { "status": ["not_started", "approved"] },
+  "event_object": {
+    "event_outcome": "approved",
+    "session_id": "kyc_01KPBJZ8T4W6Y0A2C4E6G8J1LN",
+    "customer": {
+      "id": "cust_01HXYZABC1234567890ABCDEFG",
+      "merchant_reference": "user_4471",
+      "type": "individual",
+      "name": "Alice Johnson",
+      "email": "alice@example.com",
+      "country_code": "NG",
+      "tier": "tier_2",
+      "tier_upgraded_from": "tier_1",
+      "kyc_status": "approved"
+    },
+    "verification": {
+      "tier_requested": "tier_2",
+      "provider": "sumsub",
+      "profile": {
+        "type": "individual",
+        "first_name": "Alice",
+        "last_name": "Johnson",
+        "dob": "1992-04-17",
+        "country": "NGA",
+        "nationality": "NGA",
+        "id_docs": [
+          { "id_doc_type": "PASSPORT", "country": "NGA", "number_last4": "8821", "valid_until": "2031-06-30" }
+        ],
+        "fetched_at": "2026-09-30T13:07:20.000Z"
+      }
+    },
+    "merchant_activation_triggered": false
+  }
+}
+```
+
+`kyc.rejected` replaces `profile` with the reason:
+
+```json theme={null}
+{
+  "event_type": "kyc.rejected",
+  "event_object_status": "rejected",
+  "event_object": {
+    "event_outcome": "rejected",
+    "session_id": "kyc_01KPBJZ8T4W6Y0A2C4E6G8J1LN",
+    "customer": {
+      "id": "cust_01HXYZABC1234567890ABCDEFG",
+      "type": "individual",
+      "name": "Alice Johnson",
+      "country_code": "NG",
+      "tier": "tier_1",
+      "kyc_status": "rejected"
+    },
+    "verification": {
+      "tier_requested": "tier_2",
+      "provider": "sumsub",
+      "failure_reason": "document_quality",
+      "failure_reason_message": "The submitted document could not be read clearly. Please upload a clearer copy."
+    },
+    "merchant_activation_triggered": false
+  }
+}
+```
+
+`tier_upgraded_from` appears only when the approval actually promoted the customer. Fields with no
+value are omitted rather than sent as `null`.
+
+## Delivery
+
+<Steps>
+  <Step title="Return 2xx quickly">
+    Acknowledge with any `2xx` as soon as you have stored the event. Do the work afterwards — a slow
+    handler looks like a failure and gets retried.
+  </Step>
+
+  <Step title="Expect at-least-once, not exactly-once">
+    A delivery can arrive more than once. `event_id` is stable across every retry of the same event,
+    so record the ids you have processed and ignore repeats.
+  </Step>
+
+  <Step title="Don't rely on order">
+    Events are not guaranteed to arrive in lifecycle order. Use `event_object_status` and
+    `event_object_changes` rather than assuming the previous event already landed, and ignore an
+    event that would move a resource backwards from a terminal state.
+  </Step>
+</Steps>
+
+A given resource emits a given event **at most once** — so two upstream changes that map to the same
+event (a cancelled transfer and then a reversed one, both `transfer.failed`) reach you once, not
+twice.
+
+### Debugging a delivery
+
+| You want to                    | Use                                                                                                                                                                                                             |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| See why deliveries are failing | [`GET /v1/notifications/webhooks/{id}/logs`](/api-reference/openapi#tag/notification-webhooks/GET/v1/notifications/webhooks/\{id}/logs) — attempt history with the HTTP status you returned, error, and latency |
+| See what is queued             | [`GET /v1/notifications/webhooks/{id}/events`](/api-reference/openapi#tag/notification-webhooks/GET/v1/notifications/webhooks/\{id}/events) — pending events, oldest first, with the payload that will be sent  |
+| Replay one you missed          | [`POST /v1/notifications/webhooks/{id}/send`](/api-reference/openapi#tag/notification-webhooks/POST/v1/notifications/webhooks/\{id}/send) with the event's `event_id` as `event_idempotency_key`                |
+
+<Note>
+  Replay only delivers to an **active** endpoint — an inactive one returns `409 invalid_status`.
+  Activate it first, then resend.
+</Note>
+
+
+# Verify webhook signatures
+Source: https://docs.globalstack.io/webhooks/verify-signatures
+
+Confirm each webhook delivery came from GlobalStack and was not tampered with in transit.
+
+Every webhook GlobalStack sends is signed. Verify the signature on each delivery before you act
+on it — it proves the request came from GlobalStack and the body was not altered in transit.
+
+Signatures follow the [Svix](https://docs.svix.com/receiving/verifying-payloads/how) standard, so
+you can verify them with an official Svix library in one call, or implement the check yourself.
+
+## What's on each delivery
+
+Every request carries three headers:
+
+| Header           | Example          | Meaning                                                               |
+| ---------------- | ---------------- | --------------------------------------------------------------------- |
+| `svix-id`        | `msg_2gT8sV...`  | Unique message id. Equals the body's `event_id` with a `msg_` prefix. |
+| `svix-timestamp` | `1718960400`     | Unix seconds when the delivery was signed.                            |
+| `svix-signature` | `v1,g0hM9SsE...` | Space-separated list of `v1,<base64-signature>` entries.              |
+
+Your **signing secret** (prefixed `whsec_`) is shown in plaintext **once** — when you create a
+webhook endpoint or rotate its secret. Store it securely; you cannot retrieve it again.
+
+<Warning>
+  Verify against the **raw** request body — the exact bytes you received. If you parse the JSON and
+  re-serialize it before verifying, the bytes change and verification fails. Read the raw body first,
+  verify, then parse.
+</Warning>
+
+## Verify with a Svix library (recommended)
+
+The library handles the construction, the multi-signature format, timing-safe comparison, and
+timestamp (replay) checks for you.
+
+<CodeGroup>
+  ```ts Node.js theme={null}
+  import { Webhook } from "svix";
+
+  const secret = process.env.WEBHOOK_SIGNING_SECRET; // whsec_...
+
+  // `rawBody` must be the raw request body string, not the parsed object.
+  const wh = new Webhook(secret);
+  const payload = wh.verify(rawBody, {
+    "svix-id": req.headers["svix-id"],
+    "svix-timestamp": req.headers["svix-timestamp"],
+    "svix-signature": req.headers["svix-signature"],
+  }); // throws on an invalid signature
+  ```
+
+  ```python Python theme={null}
+  from svix.webhooks import Webhook, WebhookVerificationError
+
+  secret = os.environ["WEBHOOK_SIGNING_SECRET"]  # whsec_...
+
+  wh = Webhook(secret)
+  try:
+      payload = wh.verify(raw_body, dict(request.headers))
+  except WebhookVerificationError:
+      return "", 400
+  ```
+
+  ```go Go theme={null}
+  import svix "github.com/svix/svix-webhooks/go"
+
+  wh, err := svix.NewWebhook(secret) // whsec_...
+  if err != nil {
+      // handle bad secret
+  }
+  if err := wh.Verify(rawBody, req.Header); err != nil {
+      http.Error(w, "invalid signature", http.StatusBadRequest)
+      return
+  }
+  ```
+
+  ```ruby Ruby theme={null}
+  require "svix"
+
+  wh = Svix::Webhook.new(secret) # whsec_...
+  begin
+    payload = wh.verify(raw_body, headers)
+  rescue Svix::WebhookVerificationError
+    halt 400
+  end
+  ```
+
+  ```php PHP theme={null}
+  use Svix\Webhook;
+
+  $wh = new Webhook($secret); // whsec_...
+  try {
+      $payload = $wh->verify($rawBody, $headers);
+  } catch (\Svix\Exception\WebhookVerificationException $e) {
+      http_response_code(400);
+      exit;
+  }
+  ```
+
+  ```java Java theme={null}
+  import com.svix.Webhook;
+
+  Webhook webhook = new Webhook(secret); // whsec_...
+  webhook.verify(rawBody, headers); // throws WebhookVerificationException
+  ```
+</CodeGroup>
+
+<Note>
+  Svix maintains official verification libraries for these and more languages. Install with your
+  package manager — `npm i svix`, `pip install svix`, `go get github.com/svix/svix-webhooks/go`,
+  `gem install svix`, `composer require svix/svix`, or Maven/Gradle (`com.svix:svix`) — and see the
+  [full list](https://github.com/svix/svix-webhooks).
+</Note>
+
+## Verify manually
+
+If there's no Svix library for your stack, reproduce the signature yourself:
+
+<Steps>
+  <Step title="Build the signed content">
+    Join the id, timestamp, and the **raw** body with dots:
+    `signed_content = svix_id + "." + svix_timestamp + "." + raw_body`
+  </Step>
+
+  <Step title="Derive the key">
+    Drop the `whsec_` prefix from your signing secret and base64-decode the remainder. Those bytes
+    are your HMAC key.
+  </Step>
+
+  <Step title="Sign">
+    Compute `base64(HMAC-SHA256(key, signed_content))`.
+  </Step>
+
+  <Step title="Compare">
+    The `svix-signature` header is a space-separated list of `v1,<signature>` entries (an endpoint can
+    have more than one valid secret during a rotation). Compare your value against each entry's
+    signature — the part after `v1,` — using a constant-time comparison. Accept if any matches.
+  </Step>
+
+  <Step title="Check the timestamp">
+    Reject deliveries whose `svix-timestamp` is more than a few minutes from your current time, to
+    guard against replay.
+  </Step>
+</Steps>
+
+<CodeGroup>
+  ```js Node.js theme={null}
+  const crypto = require("crypto");
+
+  function verify(rawBody, headers, secret) {
+    const id = headers["svix-id"];
+    const ts = headers["svix-timestamp"];
+    const sigHeader = headers["svix-signature"]; // "v1,aaa v1,bbb"
+
+    if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false; // replay guard
+
+    const signedContent = `${id}.${ts}.${rawBody}`;
+    const key = Buffer.from(secret.replace(/^whsec_/, ""), "base64");
+    const expected = crypto.createHmac("sha256", key).update(signedContent).digest("base64");
+
+    return sigHeader.split(" ").some((part) => {
+      const sig = part.split(",")[1];
+      return (
+        sig &&
+        sig.length === expected.length &&
+        crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
+      );
+    });
+  }
+  ```
+
+  ```python Python theme={null}
+  import base64, hashlib, hmac, time
+
+  def verify(raw_body: str, headers, secret: str) -> bool:
+      svix_id = headers["svix-id"]
+      svix_ts = headers["svix-timestamp"]
+      sig_header = headers["svix-signature"]  # "v1,aaa v1,bbb"
+
+      if abs(time.time() - int(svix_ts)) > 300:  # replay guard
+          return False
+
+      signed_content = f"{svix_id}.{svix_ts}.{raw_body}"
+      key = base64.b64decode(secret.removeprefix("whsec_"))
+      expected = base64.b64encode(
+          hmac.new(key, signed_content.encode(), hashlib.sha256).digest()
+      ).decode()
+
+      return any(
+          hmac.compare_digest(part.split(",", 1)[1], expected)
+          for part in sig_header.split()
+          if "," in part
+      )
+  ```
+
+  ```go Go theme={null}
+  func verify(rawBody, id, ts, sigHeader, secret string) bool {
+      n, err := strconv.ParseInt(ts, 10, 64)
+      if err != nil || math.Abs(float64(time.Now().Unix()-n)) > 300 {
+          return false // replay guard
+      }
+
+      signed := id + "." + ts + "." + rawBody
+      key, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(secret, "whsec_"))
+      mac := hmac.New(sha256.New, key)
+      mac.Write([]byte(signed))
+      expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+      for _, part := range strings.Fields(sigHeader) {
+          if sig := strings.SplitN(part, ",", 2); len(sig) == 2 &&
+              hmac.Equal([]byte(sig[1]), []byte(expected)) {
+              return true
+          }
+      }
+      return false
+  }
+  ```
+</CodeGroup>
+
+## Deduplicating events
+
+The body's `event_id` equals the `svix-id` without its `msg_` prefix. Use either to deduplicate —
+a delivery may be retried, and the same `event_id` arrives more than once. Treat your handler as
+idempotent: record processed `event_id`s and ignore repeats.
+
+

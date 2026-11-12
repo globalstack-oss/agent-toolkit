@@ -1,0 +1,9 @@
+{
+  "name": "globalstack-example-ngn-withdraw",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "tsx src/setup.ts",
+    "start": "tsx src/server.ts"
+  }
+}
